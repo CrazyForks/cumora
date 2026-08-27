@@ -29,6 +29,7 @@ import { useCalendar } from '@/stores/calendar'
 import { PollBubble } from './PollBubble'
 import { LinkPreview, firstUrlInBody } from './LinkPreview'
 import { useT } from '@/lib/i18n'
+import { useChatLayoutStore } from '@/lib/chatLayout'
 
 function MentionChip({ id }: { id: string }) {
   const t = useT()
@@ -91,7 +92,7 @@ function MentionChip({ id }: { id: string }) {
           // uses the same value): `baseline`/`middle` ride high, -0.25em (the
           // old value) sat visibly low. Keep this in sync with RichInput.
           'inline-flex items-center justify-center gap-1 px-1.5 py-0.5 rounded-full font-semibold cursor-pointer transition',
-          isAgent ? 'text-skype-deep bg-sky-50 hover:bg-sky-100'
+          isAgent ? 'text-skype-deep bg-sky2-50 hover:bg-sky2-100'
                   : 'text-coral-deep bg-coral-soft hover:brightness-95',
         )}
         style={{ verticalAlign: '-0.15em' }}
@@ -327,7 +328,7 @@ function MessageRefChip({ n }: { n: number }) {
         onClick={onClick}
         onMouseEnter={enter}
         onMouseLeave={leave}
-        className="inline-flex items-center px-1.5 py-0.5 rounded-full font-semibold cursor-pointer transition text-skype-deep bg-sky-50 hover:bg-sky-100"
+        className="inline-flex items-center px-1.5 py-0.5 rounded-full font-semibold cursor-pointer transition text-skype-deep bg-sky2-50 hover:bg-sky2-100"
         // Measured against 14px / line-height 1.55 CJK text — -0.05em centers
         // the chip on the CJK glyph center; -0.15em (the MentionChip value)
         // visibly sits low here because there's no avatar to anchor it.
@@ -1700,6 +1701,7 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
   const openAgentInfo = useApp((s) => s.openAgentInfo)
   const openThreadView = useApp((s) => s.openThreadView)
   const meId = useMe()
+  const split = useChatLayoutStore((s) => s.layout === 'bubble')
   // System / whisper rows don't need a resolved author — handle them before
   // touching `author` so a synthetic-author system message (the calendar-fired
   // notice, authored by CALENDAR_SYSTEM_AUTHOR_ID) renders instead of being
@@ -1724,12 +1726,71 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
   const onAvatarClick = () => {
     if (!isMine) openAgentInfo(author.id)
   }
+  const alignEnd = split && isMine
+
+  const body = (
+    <>
+      <QuoteCard msg={msg} />
+
+      {!isToolOnly && !isAttachOnly && !isPoll && (
+        <div
+          className={cn(
+            'inline-block py-2.5 px-3.5 text-[14px] leading-[1.55] break-words',
+            split ? 'max-w-full' : 'max-w-[min(100%,580px)]',
+            alignEnd
+              ? 'border rounded-tl-[14px] rounded-tr-[4px] rounded-br-[14px] rounded-bl-[14px]'
+              : cn(
+                'rounded-tl-[4px] rounded-tr-[14px] rounded-br-[14px] rounded-bl-[14px]',
+                isMine ? 'border' : 'bg-sky2-50 border border-sky2-100 text-ink-700',
+              ),
+          )}
+          style={isMine ? {
+            background: 'linear-gradient(135deg, #FFE8E1, #FFD9D2)',
+            borderColor: 'rgba(255, 122, 107, 0.25)',
+            color: '#5A2B22',
+          } : undefined}
+        >
+          <RichBody body={msg.body} conversationId={msg.conversationId} />
+        </div>
+      )}
+
+      {/* Open-Graph card for the first URL in a chat-style body. Skipped
+          for tool / attachment / poll / email kinds — those have their
+          own card UIs and a link preview underneath would be visual
+          noise. The component itself returns null when there's nothing
+          useful to render, so this gate is just to avoid spurious
+          network calls for non-text messages. */}
+      {!isToolOnly && !isAttachOnly && !isPoll && msg.kind !== 'email' && (() => {
+        const linkUrl = firstUrlInBody(msg.body)
+        return linkUrl ? <LinkPreview url={linkUrl} /> : null
+      })()}
+
+      {isPoll && <PollBubble msg={msg} />}
+
+      {msg.kind === 'tool' && <ToolCard msg={msg} />}
+      {artifactRefs.length > 0 && (
+        <div className="flex flex-col">
+          {artifactRefs.map((ref) => (
+            ref.type === 'document'
+              ? <DocumentArtifactCard key={artifactKey(ref)} id={ref.id} conversationId={msg.conversationId} />
+              : ref.type === 'board'
+                ? <BoardArtifactCard key={artifactKey(ref)} id={ref.id} />
+                : ref.type === 'card'
+                  ? <CardArtifactCard key={artifactKey(ref)} id={ref.id} />
+                  : <CalendarArtifactCard key={artifactKey(ref)} id={ref.id} />
+          ))}
+        </div>
+      )}
+      {msg.attachment && <AttachmentCard msg={msg} />}
+    </>
+  )
 
   return (
     <div
       id={`m-${msg.id}`}
       className={cn(
-        'group grid grid-cols-[38px_1fr] gap-3 items-start scroll-mt-20',
+        'group gap-3 items-start scroll-mt-20',
+        alignEnd ? 'flex flex-row-reverse' : 'grid grid-cols-[38px_1fr]',
         animate && 'animate-rise',
       )}
       style={animate ? { animationDelay: `${delay}ms` } : undefined}
@@ -1737,69 +1798,31 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
       <button
         onClick={onAvatarClick}
         disabled={isMine}
-        className={cn('rounded-full transition', !isMine && 'hover:opacity-80 active:scale-95 cursor-pointer')}
+        className={cn('rounded-full transition shrink-0', !isMine && 'hover:opacity-80 active:scale-95 cursor-pointer')}
         title={isMine ? undefined : t('chat.showAuthorInfo', { name: author.name })}
       >
         <Avatar p={author} size={38} ringColor="var(--cloud)" />
       </button>
-      <div className="min-w-0">
-        <div className="flex items-baseline gap-2 mb-1">
-          <span className="font-bold text-[13.5px] text-ink-900">{author.name}</span>
-          {author.role && !isHuman && (
-            <span className="text-[10.5px] text-ink-300 font-semibold tracking-wider uppercase">{author.role}</span>
-          )}
-          {isHuman && !isMine && <HumanBadge />}
-          <span className="ml-auto text-[10.5px] text-ink-300 tabular-nums">{msg.at}</span>
-        </div>
-
-        <QuoteCard msg={msg} />
-
-        {!isToolOnly && !isAttachOnly && !isPoll && (
-          <div
-            className={cn(
-              'inline-block py-2.5 px-3.5 rounded-tl-[4px] rounded-tr-[14px] rounded-br-[14px] rounded-bl-[14px] text-[14px] leading-[1.55] max-w-[min(100%,580px)] break-words',
-              isMine
-                ? 'border'
-                : 'bg-sky2-50 border border-sky2-100 text-ink-700'
+      <div className={cn('min-w-0', alignEnd ? 'flex-1 flex flex-col items-end' : '')}>
+        {(!split || !isMine) && (
+          <div className="flex items-baseline gap-2 mb-1">
+            <span className="font-bold text-[13.5px] text-ink-900">{author.name}</span>
+            {author.role && !isHuman && (
+              <span className="text-[10.5px] text-ink-300 font-semibold tracking-wider uppercase">{author.role}</span>
             )}
-            style={isMine ? {
-              background: 'linear-gradient(135deg, #FFE8E1, #FFD9D2)',
-              borderColor: 'rgba(255, 122, 107, 0.25)',
-              color: '#5A2B22',
-            } : undefined}
-          >
-            <RichBody body={msg.body} conversationId={msg.conversationId} />
+            {isHuman && !isMine && <HumanBadge />}
+            {!split && (
+              <span className="ml-auto text-[10.5px] text-ink-300 tabular-nums">{msg.at}</span>
+            )}
           </div>
         )}
 
-        {/* Open-Graph card for the first URL in a chat-style body. Skipped
-            for tool / attachment / poll / email kinds — those have their
-            own card UIs and a link preview underneath would be visual
-            noise. The component itself returns null when there's nothing
-            useful to render, so this gate is just to avoid spurious
-            network calls for non-text messages. */}
-        {!isToolOnly && !isAttachOnly && !isPoll && msg.kind !== 'email' && (() => {
-          const linkUrl = firstUrlInBody(msg.body)
-          return linkUrl ? <LinkPreview url={linkUrl} /> : null
-        })()}
-
-        {isPoll && <PollBubble msg={msg} />}
-
-        {msg.kind === 'tool' && <ToolCard msg={msg} />}
-        {artifactRefs.length > 0 && (
-          <div className="flex flex-col">
-            {artifactRefs.map((ref) => (
-              ref.type === 'document'
-                ? <DocumentArtifactCard key={artifactKey(ref)} id={ref.id} conversationId={msg.conversationId} />
-                : ref.type === 'board'
-                  ? <BoardArtifactCard key={artifactKey(ref)} id={ref.id} />
-                  : ref.type === 'card'
-                    ? <CardArtifactCard key={artifactKey(ref)} id={ref.id} />
-                    : <CalendarArtifactCard key={artifactKey(ref)} id={ref.id} />
-            ))}
+        {split ? (
+          <div className={cn('flex items-end gap-1.5 max-w-full', isMine && 'flex-row-reverse')}>
+            <div className="min-w-0 max-w-[min(100%,580px)]">{body}</div>
+            <span className="shrink-0 text-[10.5px] text-ink-300 tabular-nums leading-none pb-1">{msg.at}</span>
           </div>
-        )}
-        {msg.attachment && <AttachmentCard msg={msg} />}
+        ) : body}
 
         {(msg.failed || msg.unconfirmed) && (
           <div className="mt-1 flex items-center gap-2 text-[11px] text-coral-deep">

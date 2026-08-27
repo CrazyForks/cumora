@@ -1,0 +1,142 @@
+/**
+ * Cached engine detection + inherit/default for BYOA computers.
+ *
+ * Run: node --import tsx --test server/src/__tests__/agents-computer-engine-detect.test.ts
+ */
+import { after, afterEach, test } from 'node:test'
+import assert from 'node:assert/strict'
+
+process.env.CUMORA_RUNTIME_CLIENT = 'http'
+process.env.CUMORA_DEFAULT_CLAUDE_MODEL = 'claude-opus-4-7'
+process.env.OPENAI_API_KEY ??= 'test-key'
+
+const registry = await import('../agents/computer/registry.js')
+const { pool } = await import('../db/pool.js')
+
+const originalQuery = pool.query.bind(pool)
+
+type QueryCall = { sql: string; params: unknown[] }
+
+function installPoolMock(handler: (call: QueryCall) => { rows?: unknown[]; rowCount?: number }) {
+  const calls: QueryCall[] = []
+  ;(pool as unknown as { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[]; rowCount: number }> }).query =
+    async (sql: string, params: unknown[] = []) => {
+      const call = { sql, params }
+      calls.push(call)
+      const out = handler(call)
+      return { rows: out.rows ?? [], rowCount: out.rowCount ?? (out.rows?.length ?? 0) }
+    }
+  return calls
+}
+
+afterEach(() => {
+  ;(pool as unknown as { query: typeof originalQuery }).query = originalQuery
+})
+
+after(async () => {
+  try { await pool.end() } catch { /* ignore */ }
+  try {
+    const { redis, sub } = await import('../redis.js')
+    redis.disconnect()
+    sub.disconnect()
+  } catch { /* ignore */ }
+})
+
+test('sanitizeDetectedEngines drops unknown ids and fills missing bins', () => {
+  const out = registry.sanitizeDetectedEngines(
+    [{ id: 'claude', bin: 'claude', path: '/usr/bin/claude' }, { id: 'bogus', bin: 'x', path: null }],
+    ['claude', 'codex', 'bogus'],
+  )
+  assert.deepEqual(out, [
+    { id: 'claude', bin: 'claude', path: '/usr/bin/claude' },
+    { id: 'codex', bin: 'codex', path: null },
+  ])
+})
+
+test('listAgentsForComputer keeps an explicit model and pins CUMORA_DEFAULT_* when empty', async () => {
+  installPoolMock(({ sql }) => {
+    if (/FROM participants/.test(sql)) {
+      return { rows: [
+        { id: 'bram', name: 'Bram', role: 'engineer', systemPrompt: null, engine: 'claude', model: 'stale-pin', fastModel: 'haiku' },
+        { id: 'saga', name: 'Saga', role: 'writer', systemPrompt: null, engine: 'claude', model: null, fastModel: null },
+      ] }
+    }
+    return { rows: [] }
+  })
+  const agents = await registry.listAgentsForComputer('comp-1')
+  assert.equal(agents[0]?.model, 'stale-pin')
+  assert.equal(agents[0]?.fastModel, 'haiku')
+  assert.equal(agents[1]?.model, 'claude-opus-4-7')
+  assert.equal(agents[1]?.engine, 'claude')
+})
+
+test('reportDetectedEngines keeps the previous default first when it is still installed', async () => {
+  const calls = installPoolMock(({ sql }) => {
+    if (/SELECT available_engines/.test(sql)) {
+      return { rows: [{ available_engines: ['codex', 'claude'], company_id: 'co-1' }] }
+    }
+    if (/UPDATE computers/.test(sql)) return { rowCount: 1 }
+    return { rows: [] }
+  })
+  const ok = await registry.reportDetectedEngines({
+    computerId: 'comp-1',
+    engines: ['claude', 'codex', 'opencode'],
+    detected: [
+      { id: 'claude', bin: 'claude', path: '/bin/claude' },
+      { id: 'codex', bin: 'codex', path: '/bin/codex' },
+      { id: 'opencode', bin: 'opencode', path: null },
+    ],
+  })
+  assert.equal(ok, true)
+  const update = calls.find((c) => /SET available_engines/.test(c.sql))
+  assert.equal(update?.params[1], JSON.stringify(['codex', 'claude', 'opencode']))
+})
+
+test('setComputerDefaultEngine reorders engines and only moves inheriting agents', async () => {
+  const calls = installPoolMock(({ sql }) => {
+    if (/SELECT available_engines/.test(sql)) {
+      return { rows: [{ available_engines: ['claude', 'codex'], detected_engines: [] }] }
+    }
+    if (/UPDATE computers/.test(sql)) return { rowCount: 1 }
+    if (/UPDATE participants SET engine/.test(sql)) return { rowCount: 3 }
+    return { rows: [] }
+  })
+  const out = await setDefault()
+  assert.deepEqual(out, { engine: 'codex', updated: 3 })
+  const moved = calls.find((c) => /UPDATE participants SET engine/.test(c.sql))
+  assert.equal(moved?.params[0], 'codex')
+  assert.match(moved?.sql ?? '', /engine_inherit = TRUE/)
+
+  async function setDefault() {
+    return registry.setComputerDefaultEngine({ computerId: 'comp-1', companyId: 'co-1', engine: 'codex' })
+  }
+})
+
+test('heartbeatComputer is quiet when the computer is already online', async () => {
+  installPoolMock(({ sql }) => {
+    if (/AND status = 'online'/.test(sql)) {
+      return { rows: [{}], rowCount: 1 }
+    }
+    return { rows: [] }
+  })
+  await registry.heartbeatComputer('comp-1', '0.5.0', true)
+})
+
+test('assignAgentToComputer pins when an engine is named and inherits when it is not', async () => {
+  installPoolMock(({ sql }) => {
+    if (/SELECT kind, available_engines/.test(sql)) {
+      return { rows: [{ kind: 'local', available_engines: ['claude', 'codex'] }] }
+    }
+    if (/UPDATE participants SET computer_id/.test(sql)) return { rowCount: 1 }
+    return { rows: [] }
+  })
+  const pinned = await registry.assignAgentToComputer({
+    agentId: 'bram', companyId: 'co-1', computerId: 'comp-1', engine: 'codex', inherit: false,
+  })
+  assert.deepEqual(pinned, { kind: 'local', engine: 'codex', inherit: false })
+
+  const inherited = await registry.assignAgentToComputer({
+    agentId: 'bram', companyId: 'co-1', computerId: 'comp-1', inherit: true,
+  })
+  assert.deepEqual(inherited, { kind: 'local', engine: 'claude', inherit: true })
+})

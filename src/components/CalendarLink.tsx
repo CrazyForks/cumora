@@ -32,7 +32,7 @@ export function CalendarLink({ id: rawId }: { id: string }) {
         if (view === 'conversations') openCalendarEventPeek(id)
         else setView('calendar')
       }}
-      className="inline-flex max-w-[260px] items-center gap-1.5 rounded-full border border-sky2-100 bg-[#F5FBFF] px-2 py-0.5 text-[13px] font-semibold text-skype-deep no-underline transition hover:border-sky2-200 hover:bg-[#EAF7FD]"
+      className="inline-flex max-w-[260px] items-center gap-1.5 rounded-full border border-sky2-100 bg-sky2-50 px-2 py-0.5 text-[13px] font-semibold text-skype-deep no-underline transition hover:border-sky2-200 hover:bg-sky2-100"
       style={{ verticalAlign: '-0.16em' }}
       title={`Open calendar event ${id}`}
       aria-label={`Open calendar event ${label}`}

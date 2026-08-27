@@ -2,6 +2,8 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, shell, nativeTheme, screen, ipcMain, globalShortcut, protocol, net } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
+const os = require('node:os')
+const { spawn } = require('node:child_process')
 const http = require('node:http')
 const crypto = require('node:crypto')
 const { pathToFileURL } = require('node:url')
@@ -1387,6 +1389,103 @@ ipcMain.on('notification:dismiss', (_event, id) => {
 // (e.g. at boot, before the first focus/blur event has fired).
 ipcMain.handle('app:is-focused', () => {
   return !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused())
+})
+
+// Keep in sync with src/lib/engines.ts. Official daemon detectEngines() only
+// probes engines with adapters (claude/cursor/codex/grok/opencode/pi). The rest
+// are listed so the Me page can show what is installed on THIS machine; they
+// cannot be assigned to people.
+const LOCAL_CLIS = [
+  { id: 'claude', bin: 'claude' },
+  { id: 'cursor', bin: 'cursor-agent' },
+  { id: 'codex', bin: 'codex' },
+  { id: 'grok', bin: 'grok' },
+  { id: 'opencode', bin: 'opencode' },
+  { id: 'pi', bin: 'pi' },
+  { id: 'gemini', bin: 'gemini' },
+  { id: 'qwen', bin: 'qwen' },
+  { id: 'hermes', bin: 'hermes' },
+]
+
+function detectSearchPath() {
+  const home = os.homedir()
+  const extra = [
+    path.join(home, '.local', 'bin'),
+    path.join(home, 'bin'),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    path.join(home, '.npm-global', 'bin'),
+    path.join(home, '.volta', 'bin'),
+    path.join(home, '.asdf', 'shims'),
+  ]
+  const parts = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)
+  for (const dir of extra) {
+    if (!parts.includes(dir)) parts.unshift(dir)
+  }
+  return parts.join(path.delimiter)
+}
+
+function spawnText(cmd, args, envPath) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, PATH: envPath ?? process.env.PATH },
+    })
+    let out = ''
+    child.stdout?.on('data', (buf) => { out += buf.toString('utf8') })
+    child.on('error', () => resolve(''))
+    child.on('close', () => resolve(out.trim()))
+  })
+}
+
+async function resolveCliPath(bin, envPath) {
+  const whichCmd = process.platform === 'win32' ? 'where' : 'which'
+  const fromWhich = (await spawnText(whichCmd, [bin], envPath)).split(/\r?\n/)[0]?.trim()
+  if (fromWhich) return fromWhich
+  const home = os.homedir()
+  const names = process.platform === 'win32' ? [bin, `${bin}.cmd`, `${bin}.exe`] : [bin]
+  const dirs = [
+    path.join(home, '.local', 'bin'),
+    path.join(home, 'bin'),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+  ]
+  for (const dir of dirs) {
+    for (const name of names) {
+      const candidate = path.join(dir, name)
+      try {
+        await fs.promises.access(candidate)
+        return candidate
+      } catch { /* next */ }
+    }
+  }
+  return null
+}
+
+async function detectLocalHostNames() {
+  const names = new Set()
+  try {
+    const host = os.hostname()
+    if (host) names.add(host)
+  } catch { /* ignore */ }
+  if (process.platform === 'darwin') {
+    for (const key of ['ComputerName', 'LocalHostName']) {
+      const name = await spawnText('scutil', ['--get', key])
+      if (name) names.add(name)
+    }
+  }
+  return [...names]
+}
+
+ipcMain.handle('detect:local-clis', async () => {
+  const envPath = detectSearchPath()
+  const hostNames = await detectLocalHostNames()
+  const clis = []
+  for (const { id, bin } of LOCAL_CLIS) {
+    const resolved = await resolveCliPath(bin, envPath)
+    if (resolved) clis.push({ id, bin, path: resolved })
+  }
+  return { hostNames, clis }
 })
 
 ipcMain.on('theme:set', (_event, source) => {

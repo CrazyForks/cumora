@@ -15,6 +15,9 @@ export interface Computer {
   kind: ComputerKind
   status: ComputerStatus
   availableEngines: EngineId[]
+  /** Last PATH snapshot from the daemon (bin + resolved path). */
+  detectedEngines?: Array<{ id: EngineId; bin: string; path: string | null }>
+  enginesDetectedAt?: string | null
   lastSeenAt?: string | null
   pairedAt?: string | null
   /** The cumora daemon version this computer is running (null = cloud / unknown). */
@@ -52,6 +55,8 @@ export interface Participant {
   computerId?: string | null
   /** engine the agent's host runs it on ('managed' for cloud agents) */
   engine?: EngineId | null
+  /** true = follow the computer's default engine; false = pin `engine` */
+  engineInherit?: boolean
   /** Real external email address. Agents get one of the form
    *  `<id>@<companySlug>.<EMAIL_DOMAIN>` (auto-minted on first use);
    *  humans carry their auth email here for the renderer's contact

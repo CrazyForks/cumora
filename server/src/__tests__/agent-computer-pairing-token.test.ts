@@ -3,10 +3,11 @@
  *
  * Run: node --import tsx --test server/src/__tests__/agent-computer-pairing-token.test.ts
  */
-import { afterEach, test } from 'node:test'
+import { after, afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
+process.env.OPENAI_API_KEY ??= 'test-key'
 
 const registry = await import('../agents/computer/registry.js')
 const { pool } = await import('../db/pool.js')
@@ -29,6 +30,15 @@ function installPoolMock(handler: (call: QueryCall) => { rows?: unknown[]; rowCo
 
 afterEach(() => {
   ;(pool as unknown as { query: typeof originalQuery }).query = originalQuery
+})
+
+after(async () => {
+  try { await pool.end() } catch { /* ignore */ }
+  try {
+    const { redis, sub } = await import('../redis.js')
+    redis.disconnect()
+    sub.disconnect()
+  } catch { /* ignore */ }
 })
 
 test('company add token is persistent and reattaches an existing host by name', async () => {

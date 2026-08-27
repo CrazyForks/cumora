@@ -78,6 +78,40 @@ export function mergeDetectedEngines(current: string[], detected: string[]): str
   return same ? null : next
 }
 
+const ENGINE_BINS: Record<string, string> = {
+  claude: 'claude',
+  codex: 'codex',
+  grok: 'grok',
+  cursor: 'cursor-agent',
+  opencode: 'opencode',
+  pi: 'pi',
+}
+
+/** Cached PATH snapshot from the daemon. The app reads this; it never probes. */
+export interface DetectedEngine {
+  id: string
+  bin: string
+  path: string | null
+}
+
+export function sanitizeDetectedEngines(raw: unknown, engineIds: string[]): DetectedEngine[] {
+  const allowed = engineIds.filter((id) => PAIRABLE_ENGINES.has(id))
+  if (!Array.isArray(raw)) {
+    return allowed.map((id) => ({ id, bin: ENGINE_BINS[id] ?? id, path: null }))
+  }
+  const byId = new Map<string, DetectedEngine>()
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const rec = item as Record<string, unknown>
+    const id = typeof rec.id === 'string' ? rec.id : ''
+    if (!PAIRABLE_ENGINES.has(id) || !allowed.includes(id)) continue
+    const bin = typeof rec.bin === 'string' && rec.bin.trim() ? rec.bin.trim() : (ENGINE_BINS[id] ?? id)
+    const path = typeof rec.path === 'string' && rec.path.trim() ? rec.path.trim() : null
+    byId.set(id, { id, bin, path })
+  }
+  return allowed.map((id) => byId.get(id) ?? { id, bin: ENGINE_BINS[id] ?? id, path: null })
+}
+
 export interface ComputerRow {
   id: string
   company_id: string
@@ -96,6 +130,9 @@ export interface ComputerRow {
    *  FALSE = a manually-run foreground command, NULL = cloud / an old daemon
    *  that doesn't report it. Drives run-mode-specific update instructions. */
   daemon_supervised: boolean | null
+  detected_engines: DetectedEngine[]
+  engines_detected_at: string | null
+  detect_requested_at: string | null
 }
 
 /** A computer plus the computed upgrade signal the app uses to show the banner. */
@@ -221,6 +258,8 @@ export async function pairComputer(args: {
   code: string
   hostName?: string
   engines?: string[]
+  /** Optional PATH snapshot from the daemon (bin + resolved path). */
+  detected?: unknown
   /** The daemon's running version, stored so the app can flag outdated daemons. */
   version?: string
   /** Whether the daemon runs supervised (service) vs. as a foreground command. */
@@ -232,6 +271,8 @@ export async function pairComputer(args: {
   deferBroadcast?: boolean
 }): Promise<{ computerId: string; companyId: string; deviceToken: string } | null> {
   const engines = (args.engines ?? []).filter((e) => PAIRABLE_ENGINES.has(e))
+  const detected = sanitizeDetectedEngines(args.detected, engines)
+  const detectedJson = JSON.stringify(detected)
   const version = typeof args.version === 'string' && args.version ? args.version.slice(0, 32) : null
   const supervised = typeof args.supervised === 'boolean' ? args.supervised : null
   const deviceToken = randomBytes(32).toString('base64url')
@@ -252,9 +293,10 @@ export async function pairComputer(args: {
               name = COALESCE(NULLIF($3, ''), name),
               daemon_version = COALESCE($5, daemon_version),
               daemon_supervised = COALESCE($6, daemon_supervised),
+              detected_engines = $7::jsonb, engines_detected_at = NOW(), detect_requested_at = NULL,
               status = 'online', last_seen_at = NOW(), paired_at = NOW()
         WHERE id = $4`,
-      [hashToken(deviceToken), JSON.stringify(engines), reportedName, id, version, supervised],
+      [hashToken(deviceToken), JSON.stringify(engines), reportedName, id, version, supervised, detectedJson],
     )
     if (!args.deferBroadcast) await broadcastComputerStatus(id, companyId, 'online')
     return { computerId: id, companyId, deviceToken }
@@ -284,9 +326,10 @@ export async function pairComputer(args: {
           SET credential_hash = $1, available_engines = $2::jsonb,
               daemon_version = COALESCE($4, daemon_version),
               daemon_supervised = COALESCE($5, daemon_supervised),
+              detected_engines = $6::jsonb, engines_detected_at = NOW(), detect_requested_at = NULL,
               status = 'online', last_seen_at = NOW(), paired_at = NOW(), revoked_at = NULL
         WHERE id = $3`,
-      [hashToken(deviceToken), JSON.stringify(engines), id, version, supervised],
+      [hashToken(deviceToken), JSON.stringify(engines), id, version, supervised, detectedJson],
     )
     if (!args.deferBroadcast) await broadcastComputerStatus(id, companyId, 'online')
     return { computerId: id, companyId, deviceToken }
@@ -295,9 +338,9 @@ export async function pairComputer(args: {
   const computerId = `comp-${randomUUID().slice(0, 12)}`
   await pool.query(
     `INSERT INTO computers
-       (id, company_id, owner_user_id, name, kind, available_engines, status, credential_hash, paired_at, last_seen_at, daemon_version, daemon_supervised)
-     VALUES ($1, $2, $3, $4, 'local', $5::jsonb, 'online', $6, NOW(), NOW(), $7, $8)`,
-    [computerId, companyId, ownerUserId, name, JSON.stringify(engines), hashToken(deviceToken), version, supervised],
+       (id, company_id, owner_user_id, name, kind, available_engines, status, credential_hash, paired_at, last_seen_at, daemon_version, daemon_supervised, detected_engines, engines_detected_at)
+     VALUES ($1, $2, $3, $4, 'local', $5::jsonb, 'online', $6, NOW(), NOW(), $7, $8, $9::jsonb, NOW())`,
+    [computerId, companyId, ownerUserId, name, JSON.stringify(engines), hashToken(deviceToken), version, supervised, detectedJson],
   )
   if (!args.deferBroadcast) await broadcastComputerStatus(computerId, companyId, 'online')
   return { computerId, companyId, deviceToken }
@@ -452,7 +495,9 @@ export async function listAgentsForComputer(computerId: string): Promise<
 export async function listComputers(companyId: string): Promise<ComputerWithUpgrade[]> {
   const { rows } = await pool.query<ComputerRow>(
     `SELECT id, company_id, owner_user_id, name, kind, available_engines, status,
-            last_seen_at, paired_at, revoked_at, created_at, daemon_version, daemon_supervised
+            last_seen_at, paired_at, revoked_at, created_at, daemon_version, daemon_supervised,
+            COALESCE(detected_engines, '[]'::jsonb) AS detected_engines,
+            engines_detected_at, detect_requested_at
        FROM computers
       WHERE company_id = $1 AND revoked_at IS NULL
       ORDER BY (kind = 'cloud') DESC, created_at ASC`,
@@ -510,7 +555,9 @@ export async function assignAgentToComputer(args: {
   companyId: string
   computerId: string
   engine?: string
-}): Promise<{ kind: ComputerKind; engine: EngineId } | null> {
+  /** When true (or when no engine is named), follow the computer default. */
+  inherit?: boolean
+}): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
   const { rows } = await pool.query<{ kind: ComputerKind; available_engines: string[] }>(
     `SELECT kind, available_engines FROM computers
       WHERE id = $1 AND company_id = $2 AND revoked_at IS NULL LIMIT 1`,
@@ -520,23 +567,113 @@ export async function assignAgentToComputer(args: {
   if (!computer) return null
 
   let engine: EngineId
+  let inherit = false
   if (computer.kind === 'cloud') {
     engine = 'managed'
+    inherit = false
   } else {
     const advertised = computer.available_engines ?? []
+    const wantInherit = args.inherit === true || !args.engine
     const requested = args.engine && PAIRABLE_ENGINES.has(args.engine) ? (args.engine as EngineId) : null
-    const pick = (requested && advertised.includes(requested) ? requested : advertised[0]) as EngineId | undefined
+    const pick = (
+      wantInherit
+        ? advertised[0]
+        : (requested && advertised.includes(requested) ? requested : advertised[0])
+    ) as EngineId | undefined
     if (!pick) return null // a paired computer with no usable engine
     engine = pick
+    inherit = wantInherit
   }
 
   const { rowCount } = await pool.query(
-    `UPDATE participants SET computer_id = $1, engine = $2
-      WHERE id = $3 AND company_id = $4 AND kind = 'agent'`,
-    [args.computerId, engine, args.agentId, args.companyId],
+    `UPDATE participants SET computer_id = $1, engine = $2, engine_inherit = $3
+      WHERE id = $4 AND company_id = $5 AND kind = 'agent'`,
+    [args.computerId, engine, inherit, args.agentId, args.companyId],
   )
   if (!rowCount) return null
-  return { kind: computer.kind, engine }
+  return { kind: computer.kind, engine, inherit }
+}
+
+/** Ask the online daemon to re-probe PATH on its next heartbeat. */
+export async function requestEngineDetect(args: {
+  computerId: string
+  companyId: string
+}): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE computers SET detect_requested_at = NOW()
+      WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL`,
+    [args.computerId, args.companyId],
+  )
+  return Boolean(rowCount)
+}
+
+/** Daemon reports a fresh PATH snapshot. Keeps the current default first when
+ *  that engine is still installed. */
+export async function reportDetectedEngines(args: {
+  computerId: string
+  engines?: string[]
+  detected?: unknown
+}): Promise<boolean> {
+  const { rows } = await pool.query<{ available_engines: string[]; company_id: string }>(
+    `SELECT available_engines, company_id FROM computers
+      WHERE id = $1 AND kind <> 'cloud' AND revoked_at IS NULL LIMIT 1`,
+    [args.computerId],
+  )
+  const row = rows[0]
+  if (!row) return false
+  const incoming = (args.engines ?? []).filter((e) => PAIRABLE_ENGINES.has(e))
+  const prevDefault = (row.available_engines ?? []).find((e) => PAIRABLE_ENGINES.has(e))
+  const ordered = prevDefault && incoming.includes(prevDefault)
+    ? [prevDefault, ...incoming.filter((e) => e !== prevDefault)]
+    : incoming
+  const detected = sanitizeDetectedEngines(args.detected, ordered)
+  await pool.query(
+    `UPDATE computers
+        SET available_engines = $2::jsonb,
+            detected_engines = $3::jsonb,
+            engines_detected_at = NOW(),
+            detect_requested_at = NULL
+      WHERE id = $1`,
+    [args.computerId, JSON.stringify(ordered), JSON.stringify(detected)],
+  )
+  await broadcastComputerStatus(args.computerId, row.company_id, 'online')
+  return true
+}
+
+/** Make `engine` this computer's default and move every inheriting agent onto it. */
+export async function setComputerDefaultEngine(args: {
+  computerId: string
+  companyId: string
+  engine: string
+}): Promise<{ engine: EngineId; updated: number } | null> {
+  if (!PAIRABLE_ENGINES.has(args.engine)) return null
+  const { rows } = await pool.query<{ available_engines: string[]; detected_engines: DetectedEngine[] }>(
+    `SELECT available_engines, COALESCE(detected_engines, '[]'::jsonb) AS detected_engines
+       FROM computers
+      WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL LIMIT 1`,
+    [args.computerId, args.companyId],
+  )
+  const computer = rows[0]
+  if (!computer) return null
+  const advertised = computer.available_engines ?? []
+  if (!advertised.includes(args.engine)) return null
+  const engine = args.engine as EngineId
+  const ordered = [engine, ...advertised.filter((e) => e !== engine)]
+  const detected = sanitizeDetectedEngines(computer.detected_engines, ordered)
+  await pool.query(
+    `UPDATE computers
+        SET available_engines = $2::jsonb, detected_engines = $3::jsonb
+      WHERE id = $1`,
+    [args.computerId, JSON.stringify(ordered), JSON.stringify(detected)],
+  )
+  const moved = await pool.query(
+    `UPDATE participants SET engine = $1
+      WHERE computer_id = $2 AND company_id = $3 AND kind = 'agent'
+        AND departed_at IS NULL AND engine_inherit = TRUE`,
+    [engine, args.computerId, args.companyId],
+  )
+  await broadcastComputerStatus(args.computerId, args.companyId, 'online')
+  return { engine, updated: moved.rowCount ?? 0 }
 }
 
 /** Revoke a paired computer: the device token + every derived agent JWT stop

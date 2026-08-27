@@ -136,7 +136,7 @@ export function LinkPreview({ url }: { url: string }) {
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        className="flex w-full items-center px-3 transition hover:bg-[rgba(15,30,50,0.03)]"
+        className="flex w-full items-center px-3 transition hover:bg-sky2-50"
         style={{ color: 'var(--ink-700)', textDecoration: 'none' }}
       >
         <span className="truncate text-[12px]">{fallbackHost || url}</span>
@@ -154,7 +154,7 @@ export function LinkPreview({ url }: { url: string }) {
       href={data.url}
       target="_blank"
       rel="noopener noreferrer"
-      className="flex w-full transition-colors hover:bg-[rgba(15,30,50,0.03)]"
+      className="flex w-full transition-colors hover:bg-sky2-50"
       style={{ textDecoration: 'none' }}
     >
       {/* Thumbnail slot — fixed square so the layout doesn't depend on

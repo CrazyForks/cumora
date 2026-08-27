@@ -85,6 +85,13 @@ interface CumoraBridge {
   theme?: {
     set: (source: 'system' | 'light' | 'dark') => void
   }
+  /** Main-process PATH scan of CLIs on this machine. Electron only. */
+  detect?: {
+    localClis: () => Promise<{
+      hostNames: string[]
+      clis: Array<{ id: string; bin: string; path: string }>
+    }>
+  }
   /** Auto-update bridge — ported from alma's pattern. Surfaces
    *  electron-updater status to the renderer so the React side can
    *  render the upgrade UI without polling. Unavailable in browser /

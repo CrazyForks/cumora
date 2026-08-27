@@ -224,6 +224,7 @@ export interface ApiParticipant {
   departedAt?: string | null
   computerId?: string | null
   engine?: string | null
+  engineInherit?: boolean | null
   fastModel?: string | null
 }
 
@@ -235,6 +236,8 @@ export interface ApiComputer {
   name: string
   kind: ComputerKind
   available_engines: EngineId[]
+  detected_engines?: Array<{ id: EngineId; bin: string; path: string | null }>
+  engines_detected_at?: string | null
   status: ComputerStatus
   last_seen_at: string | null
   paired_at: string | null
@@ -919,10 +922,10 @@ export const api = {
     http<{ code: string; expiresInSeconds: number | null }>(
       `/computers/${encodeURIComponent(id)}/repair`, { method: 'POST', body: '{}' }),
   /** Move an agent to a computer, choosing its engine (Cumora Cloud = managed). */
-  assignAgentComputer: (agentId: string, computerId: string, engine?: EngineId) =>
-    http<{ ok: boolean; kind: ComputerKind; engine: EngineId }>(
+  assignAgentComputer: (agentId: string, computerId: string, engine?: EngineId, inherit?: boolean) =>
+    http<{ ok: boolean; kind: ComputerKind; engine: EngineId; inherit?: boolean }>(
       `/agents/${encodeURIComponent(agentId)}/computer`,
-      { method: 'POST', body: JSON.stringify({ computerId, engine }) }),
+      { method: 'POST', body: JSON.stringify({ computerId, engine, inherit }) }),
   createAgent: (input: AgentInput) =>
     http<{ id: string }>('/agents', { method: 'POST', body: JSON.stringify(input) }),
   updateAgent: (id: string, input: AgentInput) =>

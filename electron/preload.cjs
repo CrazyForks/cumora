@@ -103,6 +103,16 @@ contextBridge.exposeInMainWorld('cumora', {
   },
 
   /**
+   * Local CLI scan on THIS machine (main process `which` + common bin
+   * dirs). The renderer must not probe PATH itself — notebook App vs
+   * VPS daemon would mix. Official pairing only reports the five
+   * runnable engines; this surface also lists Pi / Gemini / etc.
+   */
+  detect: {
+    localClis: () => ipcRenderer.invoke('detect:local-clis'),
+  },
+
+  /**
    * Auto-update bridge. Mirrors alma's pattern:
    *   - getAppInfo() — current version + autoupdate capability flag
    *   - getStatus()  — last broadcast status (idle / checking / available / downloading / downloaded / error)

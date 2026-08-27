@@ -106,6 +106,14 @@
   --select-shadow: 0 1px 0 rgba(255, 255, 255, 0.92) inset, 0 10px 24px -24px rgba(26, 78, 120, 0.55);
   --select-menu-shadow: 0 22px 55px -24px rgba(10, 30, 60, 0.38), 0 8px 18px -12px rgba(10, 30, 60, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.72) inset;
   --select-menu-border: rgb(var(--sky-100-rgb));
+  /* Desktop-corner toast (Electron panel) + in-app frost toast. Light
+   * keeps the original white card; dark remaps onto cloud / ink. */
+  --toast-bg: #ffffff;
+  --toast-border: rgb(33 28 22 / 0.12);
+  --toast-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+  --toast-frost-bg: rgb(255 255 255 / 0.82);
+  --toast-frost-border: rgb(10 30 60 / 0.08);
+  --toast-frost-shadow: 0 18px 40px -14px rgba(10, 30, 60, 0.24), 0 6px 14px -8px rgba(10, 30, 60, 0.14), 0 0 0 1px rgba(255, 255, 255, 0.55) inset;
   /* Chat surface atmosphere + a few chrome pieces that were frozen as
    * light RGBA. Dark remaps these; light stays pixel-identical. */
   --chat-wash: radial-gradient(ellipse 80% 40% at 0% 0%, rgba(194, 230, 251, 0.3), transparent 60%), radial-gradient(ellipse 60% 40% at 100% 100%, rgba(255, 217, 210, 0.25), transparent 60%), var(--cloud);
@@ -217,6 +225,12 @@ html.dark {
   --select-shadow: 0 0 #0000;
   --select-menu-shadow: 0 22px 55px -24px rgba(0, 0, 0, 0.55), 0 8px 18px -12px rgba(0, 0, 0, 0.35);
   --select-menu-border: rgb(var(--ink-200-rgb));
+  --toast-bg: rgb(var(--cloud-rgb));
+  --toast-border: rgb(var(--ink-200-rgb));
+  --toast-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  --toast-frost-bg: rgb(var(--cloud-rgb) / 0.88);
+  --toast-frost-border: rgb(var(--ink-200-rgb) / 0.85);
+  --toast-frost-shadow: 0 18px 40px -14px rgba(0, 0, 0, 0.55), 0 6px 14px -8px rgba(0, 0, 0, 0.35), 0 0 0 1px rgb(255 255 255 / 0.04) inset;
   --chat-wash: rgb(var(--cloud-rgb));
   --whispers-wash: rgb(var(--cloud-rgb));
   --whisper-room-wash: rgb(var(--paper-rgb));
@@ -926,8 +940,8 @@ input:focus, textarea:focus, button:focus { outline: none; }
   color: var(--ink-500);
 }
 .reaction-quick-button:hover {
-  background: rgba(0, 168, 240, 0.08);
-  box-shadow: 0 8px 18px -16px rgba(0, 120, 200, 0.5);
+  background: rgb(var(--skype-rgb) / 0.12);
+  box-shadow: 0 8px 18px -16px rgb(var(--skype-deep-rgb) / 0.5);
 }
 .reaction-burst {
   position: absolute;

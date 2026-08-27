@@ -280,22 +280,20 @@ function ToastCard({ toast, onClick, onDismiss }: { toast: Toast; onClick: () =>
       onMouseLeave={() => setHovered(false)}
       className="text-left"
       style={{
-        // Solid opaque card on a transparent BrowserWindow. Mirrors
-        // wails-gui (toast_window_assets/toast.html — `--panel: #ffffff`
-        // + `border: 1px solid rgba(33, 28, 22, 0.12)`, no box-shadow).
+        // Solid opaque card on a transparent BrowserWindow. Tokens remap
+        // under html.dark so this panel follows the same One Dark Pro
+        // chrome as the main window (hardcoded #ffffff stayed white).
         //
         // We can't give each toast its own NSWindow inside Electron, so
         // when toasts stack inside ONE window their CSS drop shadows
         // bleed into each other and look like a single big frosted
-        // rectangle. wails-gui's answer is "no toast-level shadow at all"
-        // — separation comes from the 1px hairline border + spacing. We
-        // do the same; just a tiny low-spread shadow for lift, nothing
-        // that extends past the card more than a few pixels.
-        background: '#ffffff',
+        // rectangle. Keep the shadow tiny; separation comes from the
+        // hairline border + spacing.
+        background: 'var(--toast-bg)',
         borderRadius: 14,
         padding: '14px 16px',
-        boxShadow: '0 2px 6px rgba(0, 0, 0, 0.08)',
-        border: '1px solid rgba(33, 28, 22, 0.12)',
+        boxShadow: 'var(--toast-shadow)',
+        border: '1px solid var(--toast-border)',
         cursor: 'pointer',
         minWidth: 280,
         maxWidth: 340,

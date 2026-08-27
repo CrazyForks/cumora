@@ -27,7 +27,7 @@ import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
-import { detectEngines, detectEnginesWithStatus, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
+import { detectEnginesWithStatus, snapshotDetectedEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
@@ -693,9 +693,12 @@ function helpText(): string {
 }
 
 async function requireLocalEngine(): Promise<EngineId[]> {
-  const engines = await detectEngines()
-  if (engines.length === 0) throw new Error(missingEngineMessage())
-  return engines
+  const detected = await detectEnginesWithStatus()
+  if (!detected.reliable) {
+    throw new Error('could not scan PATH (`which` / `where` failed). Fix that, then retry pairing.')
+  }
+  if (detected.engines.length === 0) throw new Error(missingEngineMessage())
+  return detected.engines
 }
 
 /** Resolve the engine a daemon can actually run from its LIVE PATH inventory. */
@@ -862,9 +865,13 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
     }
     engines = [preferredEngine as EngineId, ...detected.filter((e) => e !== preferredEngine)]
   }
+  const snapshot = await snapshotDetectedEngines(engines)
   const paired = await api<{ computerId: string; deviceToken: string }>(
     serverUrl, '/api/computers/pair',
-    { method: 'POST', body: JSON.stringify({ code, hostName: await detectHostName(), engines, version: CURRENT_VERSION, supervised: SUPERVISED }) },
+    { method: 'POST', body: JSON.stringify({
+      code, hostName: await detectHostName(), engines, detected: snapshot,
+      version: CURRENT_VERSION, supervised: SUPERVISED,
+    }) },
   )
   await saveConfig({ serverUrl, computerId: paired.computerId, deviceToken: paired.deviceToken })
   console.log(`[computer] paired as ${paired.computerId} (default engine: ${engines[0] ?? 'none'}; available: ${engines.join(', ') || 'none'}) — starting…`)
@@ -973,19 +980,10 @@ const ENGINE_MODEL_LOCAL = 'local'
 
 /** The model the LOCAL engine should run this agent's turns on.
  *
- *  Cumora pins a model per agent (participants.model, else the deploy-level
- *  CUMORA_DEFAULT_* default) so a CLI upgrade can't silently change behaviour.
- *  That pin is an Anthropic/OpenAI model id — which is simply wrong for a BYOA
- *  operator whose `claude` points at a custom provider (CC Switch and friends):
- *  the provider has never heard of e.g. `claude-opus-4-7`, so EVERY turn dies
- *  with "There's an issue with the selected model". The pin is resolved
- *  server-side, so on hosted Cumora the operator cannot change it, and their
- *  only escape was CUMORA_CLAUDE_ARGS — which also disables the persistent
- *  session and makes them hand-write the entire flag set.
- *
- *  CUMORA_ENGINE_MODEL overrides the pin daemon-side. The value `local` passes
- *  NO model at all, so the CLI runs on whatever it is already configured for —
- *  the same escape CUMORA_TRIAGE_MODEL already gives the small brain.
+ *  BYOA wakes omit `--model` by default so the machine's CLI uses its own
+ *  config (Claude `settings.json`, Codex `config.toml`, …). The daemon
+ *  discovery list leaves `agent.model` unset; `CUMORA_ENGINE_MODEL=local`
+ *  is the same no-pin path. A concrete `CUMORA_ENGINE_MODEL` still overrides.
  *
  *  Exported for tests. */
 export function resolveEngineModel(
@@ -2515,7 +2513,20 @@ async function doRun(serverOverride?: string): Promise<void> {
       const next = detected.engines
       const previous = engineInventory.current
       const changed = replaceEngineInventory(engineInventory, next)
-      if (changed) console.log(`[computer] engines on PATH changed: ${previous.join(', ') || 'none'} → ${next.join(', ') || 'none'}`)
+      if (changed) {
+        console.log(`[computer] engines on PATH changed: ${previous.join(', ') || 'none'} → ${next.join(', ') || 'none'}`)
+        // Heartbeat already advertises the live inventory. This snapshot is
+        // only the PATH display the app reads — pairable engines, never the
+        // detect-only bins Electron lists on the Me page.
+        const snapshot = await snapshotDetectedEngines(next)
+        await api(cfg.serverUrl, '/api/computers/me/engines', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+          body: JSON.stringify({ engines: next, detected: snapshot }),
+        }).catch((err) => {
+          console.warn('[computer] engine snapshot report failed', err instanceof Error ? err.message : err)
+        })
+      }
       // This is the same live inventory sync() uses to choose an agent's
       // adapter. Updating only a heartbeat cache would advertise a newly
       // installed engine while silently running that agent on the old default.

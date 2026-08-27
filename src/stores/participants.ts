@@ -71,6 +71,9 @@ function fromApi(p: ApiParticipant): Participant {
     departedAt: p.departedAt ?? null,
     computerId: p.computerId ?? null,
     engine: (p.engine as Participant['engine']) ?? null,
+    // Official API omits this field. Don't coerce missing → true or the
+    // editor always shows "Default · Claude" even when engine is Cursor.
+    engineInherit: p.engineInherit == null ? undefined : p.engineInherit,
   }
 }
 

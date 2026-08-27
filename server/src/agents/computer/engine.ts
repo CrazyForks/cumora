@@ -3326,6 +3326,28 @@ export async function detectEngines(): Promise<EngineId[]> {
   return (await detectEnginesWithStatus()).engines
 }
 
+/** One detected engine as stored on the computer row and shown in the app.
+ *  Paths are resolved on the daemon machine (Windows `where` / POSIX `which`);
+ *  the renderer never probes PATH. */
+export interface DetectedEngineSnapshot {
+  id: EngineId
+  bin: string
+  path: string | null
+}
+
+/** Snapshot the installed engines, optionally in a caller-supplied order
+ *  (pairing puts the chosen default first). Does not spawn the CLIs. */
+export async function snapshotDetectedEngines(ids?: EngineId[]): Promise<DetectedEngineSnapshot[]> {
+  const present = ids ?? await detectEngines()
+  return Promise.all(present.map(async (id) => {
+    const bin = ADAPTERS[id].bin
+    const path = id === 'grok'
+      ? (resolveGrokBin() ?? await resolveBinPath(bin))
+      : await resolveBinPath(bin)
+    return { id, bin, path }
+  }))
+}
+
 /** Resolve a bin's absolute path on PATH (the first hit), or null if absent. */
 export async function resolveBinPath(bin: string): Promise<string | null> {
   return new Promise((resolve) => {

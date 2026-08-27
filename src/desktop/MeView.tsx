@@ -7,11 +7,13 @@ import { useDevtools } from '@/stores/devtools'
 import { useAuth } from '@/stores/auth'
 import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
-import { AppearancePicker } from '@/components/AppearancePicker'
+import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
 import { LanguagePicker } from '@/components/LanguagePicker'
 import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
+import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINE_IDS, engineLabel } from '@/lib/engines'
+import type { Computer, EngineId } from '@/types'
 
 // The tab's identity is its `key`; the label is a message key resolved at
 // render. Before this they were the same string, which would have made
@@ -723,6 +725,16 @@ function AppearanceSection() {
         </div>
         <AppearancePicker className="w-[180px] shrink-0" />
       </div>
+      <div className="bg-cloud rounded-[14px] p-4 flex items-center gap-4 mt-2"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="flex-1 min-w-0">
+          <div className="font-semibold text-[13px] text-ink-900">{t('common.chatLayout')}</div>
+          <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">
+            {t('common.chatLayoutSub')}
+          </div>
+        </div>
+        <ChatLayoutPicker className="w-[180px] shrink-0" />
+      </div>
     </Section>
   )
 }
@@ -756,12 +768,62 @@ function SkypeSoundSection() {
   )
 }
 
-// Brand and engine names stay in English in every locale. The values
-// below are display labels surfaced to users when we list computers —
-// products keep their own casing.
-const ENGINE_LABEL: Record<string, string> = { managed: 'Cumora', claude: 'Claude Code', codex: 'Codex', grok: 'Grok Build', cursor: 'Cursor', opencode: 'OpenCode', pi: 'pi' }
 const KIND_ICON: Record<string, string> = { cloud: '☁', local: '💻', vps: '🖥' }
 const STATUS_COLOR: Record<string, string> = { online: '#3BB273', busy: '#E6A23C', offline: 'var(--ink-300)' }
+
+type AgentRow = { id: string; bin: string; path: string | null }
+
+const CLI_ORDER = [
+  'claude', 'cursor', 'codex', 'grok', 'opencode',
+  'pi', 'gemini', 'qwen', 'hermes',
+]
+
+const COMPUTER_STATUS_KEY: Record<string, MessageKey> = {
+  online: 'me.computerStatus.online',
+  busy: 'me.computerStatus.busy',
+  offline: 'me.computerStatus.offline',
+}
+
+function pairedRows(computer: Computer): AgentRow[] {
+  if (computer.detectedEngines && computer.detectedEngines.length > 0) return computer.detectedEngines
+  return (computer.availableEngines ?? []).map((id) => ({
+    id, bin: ENGINE_BIN[id] ?? id, path: null as string | null,
+  }))
+}
+
+function namesMatch(computerName: string, hostNames: string[]): boolean {
+  const n = computerName.trim().toLowerCase().replace(/\.local$/, '')
+  if (!n) return false
+  return hostNames.some((h) => h.trim().toLowerCase().replace(/\.local$/, '') === n)
+}
+
+function isThisMachine(computer: Computer, hostNames: string[], localComputerCount: number): boolean {
+  if (computer.kind !== 'local') return false
+  if (namesMatch(computer.name, hostNames)) return true
+  return localComputerCount === 1 && hostNames.length > 0
+}
+
+function mergeAgentRows(
+  computer: Computer,
+  localClis: Array<{ id: string; bin: string; path: string }> | null,
+  thisMachine: boolean,
+): AgentRow[] {
+  const byId = new Map<string, AgentRow>()
+  for (const row of pairedRows(computer)) byId.set(row.id, row)
+  if (thisMachine && localClis) {
+    for (const hit of localClis) byId.set(hit.id, hit)
+  }
+  return [...byId.values()].sort((a, b) => {
+    const ia = CLI_ORDER.indexOf(a.id)
+    const ib = CLI_ORDER.indexOf(b.id)
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib)
+  })
+}
+
+function asRunnableEngine(id: string): EngineId | null {
+  if (RUNNABLE_ENGINE_IDS.has(id) && id !== 'managed') return id as EngineId
+  return null
+}
 
 function ComputersTab() {
   const t = useT()
@@ -782,12 +844,33 @@ function ComputersTab() {
   const [repairFor, setRepairFor] = useState<string | null>(null)
   const [repairCode, setRepairCode] = useState<string | null>(null)
   const [repairCopied, setRepairCopied] = useState(false)
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [localDetect, setLocalDetect] = useState<{
+    hostNames: string[]
+    clis: Array<{ id: string; bin: string; path: string }>
+  } | null>(null)
 
-  useEffect(() => { void useComputers.getState().refresh() }, [])
+  async function scanLocal() {
+    const fn = typeof window !== 'undefined' ? window.cumora?.detect?.localClis : undefined
+    if (!fn) return
+    try {
+      setLocalDetect(await fn())
+    } catch { /* keep previous */ }
+  }
+
+  useEffect(() => {
+    void useComputers.getState().refresh()
+    void scanLocal()
+  }, [])
   useEffect(() => { if (!repairCopied) return; const id = window.setTimeout(() => setRepairCopied(false), 1600); return () => window.clearTimeout(id) }, [repairCopied])
 
   async function toggleRepair(id: string) {
     if (repairFor === id) { setRepairFor(null); setRepairCode(null); return }
+    await openRepair(id)
+  }
+
+  async function openRepair(id: string) {
+    if (repairFor === id) return
     setRepairFor(id); setRepairCode(null)
     try { setRepairCode((await api.repairComputer(id)).code) }
     catch (e) { alert(e instanceof Error ? e.message : String(e)); setRepairFor(null) }
@@ -805,6 +888,7 @@ function ComputersTab() {
   const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engineFlag}${asService ? ' --install-service' : ''}` : ''
   const list = Object.values(byId).sort((a, b) =>
     (a.kind === 'cloud' ? 0 : 1) - (b.kind === 'cloud' ? 0 : 1) || a.name.localeCompare(b.name))
+  const localComputerCount = list.filter((c) => c.kind === 'local').length
 
   function agentCount(computerId: string, isCloud: boolean): number {
     return Object.values(participants).filter((p) =>
@@ -834,6 +918,18 @@ function ComputersTab() {
     } catch (e) { alert(e instanceof Error ? e.message : String(e)) }
   }
 
+  async function refreshEngines(id: string) {
+    setErr(null)
+    setBusyId(id)
+    try {
+      await Promise.all([useComputers.getState().refresh(), scanLocal()])
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   return (
     <div className="space-y-6">
       <Section title={t('me.sectionComputers')}>
@@ -842,16 +938,23 @@ function ComputersTab() {
 
         {!loaded && <div className="text-[13px] text-ink-400">{t('common.loading')}</div>}
 
+        {err && <div className="mb-3 text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2">{err}</div>}
+
         <div className="grid gap-3">
           {list.map((c) => {
             const n = agentCount(c.id, c.kind === 'cloud')
             const repairable = c.kind !== 'cloud'
             const expanded = repairFor === c.id
             const repairCmd = repairCode ? `npx cumora@latest agent computer --pair ${repairCode}${serverFlag}` : ''
+            const thisMachine = isThisMachine(c, localDetect?.hostNames ?? [], localComputerCount)
+            const rows = repairable
+              ? mergeAgentRows(c, thisMachine ? (localDetect?.clis ?? null) : null, thisMachine)
+              : []
+            const detecting = busyId === c.id
             return (
               <div key={c.id} className="bg-cloud rounded-[14px]" style={{ border: '1px solid var(--ink-100)' }}>
                 <div
-                  className={cn('p-4 flex items-center gap-4 rounded-[14px]', repairable && 'cursor-pointer hover:bg-sky-50/50')}
+                  className={cn('p-4 flex items-center gap-4 rounded-[14px]', repairable && 'cursor-pointer hover:bg-sky2-50')}
                   onClick={repairable ? () => void toggleRepair(c.id) : undefined}>
                   <div className="text-[22px] w-8 text-center">{KIND_ICON[c.kind] ?? '🖥'}</div>
                   <div className="flex-1 min-w-0">
@@ -859,7 +962,7 @@ function ComputersTab() {
                       <span className="font-display font-medium text-[16px] text-ink-900">{c.name}</span>
                       <span className="inline-flex items-center gap-1.5 text-[11px] text-ink-500">
                         <span className="w-2 h-2 rounded-full" style={{ background: STATUS_COLOR[c.status] ?? 'var(--ink-300)' }} />
-                        {c.status}
+                        {t(COMPUTER_STATUS_KEY[c.status] ?? 'me.computerStatus.offline')}
                       </span>
                       {c.daemonOutdated && (
                         <span className="inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-full"
@@ -870,15 +973,30 @@ function ComputersTab() {
                       )}
                     </div>
                     <div className="text-[12px] text-ink-500 mt-0.5">
-                      {c.availableEngines.map((e) => ENGINE_LABEL[e] ?? e).join(', ') || '—'}
-                      {' · '}{n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n })}
-                      {repairable && c.daemonVersion && (
-                        <>{' · '}<span className="font-mono text-[11px] text-ink-400">{t('me.daemonVersion', { version: c.daemonVersion })}</span></>
-                      )}
+                      {repairable
+                        ? (
+                          <>
+                            {n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n })}
+                            {rows.length > 0 && <>{' · '}{t('me.agentsDetected', { n: rows.length })}</>}
+                            {c.daemonVersion && (
+                              <>{' · '}<span className="font-mono text-[11px] text-ink-400">{t('me.daemonVersion', { version: c.daemonVersion })}</span></>
+                            )}
+                          </>
+                        )
+                        : (
+                          <>
+                            {c.availableEngines.map((e) => ENGINE_LABEL[e] ?? e).join(', ') || '—'}
+                            {' · '}{n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n })}
+                          </>
+                        )}
                     </div>
                   </div>
                   {repairable && (
                     <>
+                      <button type="button" disabled={detecting} onClick={(e) => { e.stopPropagation(); void refreshEngines(c.id) }}
+                        className="text-[12px] font-semibold text-skype-deep disabled:opacity-45 px-2 py-1">
+                        {detecting ? t('me.agentsRefreshing') : t('me.agentsRefresh')}
+                      </button>
                       <span className="text-[12px] font-semibold text-skype-deep">{expanded ? t('me.hideAction') : t('me.reconnect')}</span>
                       <button onClick={(e) => { e.stopPropagation(); void remove(c.id, c.name) }}
                         className="text-[12px] font-semibold text-coral-deep hover:underline px-2 py-1">
@@ -887,6 +1005,35 @@ function ComputersTab() {
                     </>
                   )}
                 </div>
+                {repairable && (
+                  rows.length === 0 ? (
+                    <div className="px-4 pb-4 text-[12px] text-ink-400">{t('me.agentsNoEngines')}</div>
+                  ) : (
+                    <div className="px-4 pb-4 space-y-2">
+                      {rows.map((row) => {
+                        const engineId = asRunnableEngine(row.id)
+                        const advertised = engineId != null && c.availableEngines.includes(engineId)
+                        const isDefault = advertised && row.id === c.availableEngines[0]
+                        return (
+                          <div key={row.id} className="flex items-center gap-3 rounded-[12px] px-3 py-2.5"
+                            style={{ border: '1px solid var(--ink-100)' }}>
+                            <div className="flex-1 min-w-0">
+                              <div className="text-[13px] font-semibold text-ink-900">{engineLabel(row.id)}</div>
+                              <div className="font-mono text-[11px] text-ink-400 truncate">
+                                {row.bin}{row.path ? ` · ${row.path}` : ''}
+                              </div>
+                            </div>
+                            {isDefault ? (
+                              <span className="text-[12px] font-semibold text-skype-deep">✓ {t('me.agentsIsDefault')}</span>
+                            ) : engineId ? null : (
+                              <span className="text-[11px] text-ink-400 shrink-0">{t('me.agentsNotRunnable')}</span>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )
+                )}
                 {expanded && (
                   <div className="px-4 pb-4 pt-3 border-t border-ink-100">
                     <div className="text-[12px] text-ink-500 mb-2 italic font-display">
@@ -912,7 +1059,7 @@ function ComputersTab() {
         </div>
 
         {code ? (
-          <div className="mt-4 bg-sky-50 rounded-[14px] p-4" style={{ border: '1px solid var(--sky-100)' }}>
+          <div className="mt-4 bg-sky2-50 rounded-[14px] p-4" style={{ border: '1px solid var(--sky-100)' }}>
             <div className="text-[13px] font-semibold text-ink-900 mb-1">
               {t('me.runOnHost')}
             </div>
@@ -964,13 +1111,10 @@ function ComputersTab() {
             `}</style>
           </div>
         ) : (
-          <>
-            {err && <div className="mt-4 text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2">{err}</div>}
-            <button onClick={addComputer} disabled={busy}
-              className="mt-4 px-4 py-2 rounded-[10px] bg-skype text-white text-[13px] font-semibold disabled:opacity-50">
-              {busy ? t('me.computersGenerating') : t('me.addComputer')}
-            </button>
-          </>
+          <button onClick={addComputer} disabled={busy}
+            className="mt-4 px-4 py-2 rounded-[10px] bg-skype text-white text-[13px] font-semibold disabled:opacity-50">
+            {busy ? t('me.computersGenerating') : t('me.addComputer')}
+          </button>
         )}
       </Section>
     </div>

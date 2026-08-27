@@ -371,17 +371,15 @@ function ToastCard({ toast, onClick, onDismiss }: { toast: Toast; onClick: () =>
       style={{
         // Browser-fallback (no Electron notification window). Floats over
         // the app's own UI, so backdrop-filter genuinely blurs the chat
-        // beneath the toast. Slightly translucent white so the frost
-        // reads, opaque enough that text never loses contrast.
-        background: 'rgba(255, 255, 255, 0.82)',
+        // beneath the toast. Tokens remap under html.dark; light stays
+        // the original frost white.
+        background: 'var(--toast-frost-bg)',
         backdropFilter: 'blur(20px) saturate(180%)',
         WebkitBackdropFilter: 'blur(20px) saturate(180%)',
         borderRadius: 14,
         padding: '10px 12px 12px',
-        // Soft sky-tinted shadow + 1px hairline — matches the rest of
-        // Cumora's "lifted-card" treatment elsewhere in the app.
-        boxShadow: '0 18px 40px -14px rgba(10, 30, 60, 0.24), 0 6px 14px -8px rgba(10, 30, 60, 0.14), 0 0 0 1px rgba(255, 255, 255, 0.55) inset',
-        border: '1px solid rgba(10, 30, 60, 0.08)',
+        boxShadow: 'var(--toast-frost-shadow)',
+        border: '1px solid var(--toast-frost-border)',
         cursor: 'pointer',
         minWidth: 280,
         maxWidth: 340,

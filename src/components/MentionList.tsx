@@ -59,14 +59,14 @@ export const MentionList = forwardRef<MentionListHandle, MentionListProps>(funct
 
   if (items.length === 0) {
     return (
-      <div className="rounded-lg bg-white border border-stone-200 shadow-lg px-3 py-2 text-xs text-stone-400">
+      <div className="rounded-lg bg-cloud border border-ink-100 shadow-lg px-3 py-2 text-xs text-ink-400">
         no match
       </div>
     )
   }
 
   return (
-    <div className="rounded-lg bg-white border border-stone-200 shadow-lg overflow-hidden min-w-[220px] max-h-[280px] overflow-y-auto py-1">
+    <div className="rounded-lg bg-cloud border border-ink-100 shadow-lg overflow-hidden min-w-[220px] max-h-[280px] overflow-y-auto py-1">
       {items.map((p, i) => (
         <button
           type="button"
@@ -83,13 +83,13 @@ export const MentionList = forwardRef<MentionListHandle, MentionListProps>(funct
             'w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-sm transition-colors',
             i === selectedIndex
               ? 'bg-skype/10 text-skype-deep'
-              : 'text-stone-700 hover:bg-stone-50',
+              : 'text-ink-700 hover:bg-sky2-50',
           )}
         >
           <Avatar p={p} size={24} />
           <div className="min-w-0 flex-1">
             <div className="truncate font-medium leading-tight">{p.name}</div>
-            <div className="truncate text-[11px] text-stone-400 leading-tight">
+            <div className="truncate text-[11px] text-ink-400 leading-tight">
               {p.kind === 'agent' ? 'agent' : 'human'}{p.role ? ` · ${p.role}` : ''}
             </div>
           </div>

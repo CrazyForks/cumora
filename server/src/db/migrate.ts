@@ -1514,6 +1514,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS companies_pair_token_idx ON companies(pair_tok
 ALTER TABLE computers ADD COLUMN IF NOT EXISTS pair_token TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS computers_pair_token_idx ON computers(pair_token) WHERE pair_token IS NOT NULL;
 
+-- Cached local-engine detection for the Agents tab / character editor.
+-- available_engines[0] remains the computer default; detected_engines holds
+-- bin + resolved path from the last pair/refresh. detect_requested_at is a
+-- one-shot flag the online daemon consumes on its next heartbeat.
+ALTER TABLE computers ADD COLUMN IF NOT EXISTS detected_engines JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE computers ADD COLUMN IF NOT EXISTS engines_detected_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE computers ADD COLUMN IF NOT EXISTS detect_requested_at TIMESTAMP WITH TIME ZONE;
+-- true = follow computers.available_engines[0]; false = pin participants.engine.
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine_inherit BOOLEAN NOT NULL DEFAULT TRUE;
+
 -- ============== Evidence-backed feature shipping =======================
 -- A shipping feature is deliberately distinct from a generic board card.
 -- Cards answer "what are we doing?"; a feature contract answers "what must

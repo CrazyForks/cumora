@@ -15,6 +15,15 @@ const config: Config = {
           deep: rgb('--skype-deep-rgb'),
           ink: rgb('--skype-ink-rgb'),
         },
+        // Default Tailwind `sky` is a frozen light wash (`#f0f9ff`). Bind
+        // it to the same tokens as `sky2` so `bg-sky-50` / hover follow
+        // `html.dark`.
+        sky: {
+          50: rgb('--sky-50-rgb'),
+          100: rgb('--sky-100-rgb'),
+          200: rgb('--sky-200-rgb'),
+          300: rgb('--sky-300-rgb'),
+        },
         sky2: {
           50: rgb('--sky-50-rgb'),
           100: rgb('--sky-100-rgb'),

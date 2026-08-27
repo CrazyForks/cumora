@@ -31,7 +31,8 @@ import {
   ensureCloudComputer, issuePairingCode, pairComputer, announceComputerOnline,
   resolveDevice, mintAgentRuntimeToken, listAgentsForComputer,
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
-  cloudComputerId, issueRepairCode,
+  cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
+  setComputerDefaultEngine,
 } from '../agents/computer/registry.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
@@ -1071,7 +1072,10 @@ api.post('/agents/:id/computer', safe(async (req, res) => {
     throw new HttpError(403, 'Free tier agents run on your own computer. Upgrade to Pro to use Cumora Cloud.')
   }
   const engine = typeof req.body?.engine === 'string' ? req.body.engine : undefined
-  const out = await assignAgentToComputer({ agentId: String(req.params.id), companyId, computerId, engine })
+  const inherit = req.body?.inherit === true
+  const out = await assignAgentToComputer({
+    agentId: String(req.params.id), companyId, computerId, engine, inherit: inherit || !engine,
+  })
   if (!out) throw new HttpError(400, 'invalid computer, agent, or engine for this company')
   res.json({ ok: true, ...out })
 }))
@@ -1085,6 +1089,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   const engines = Array.isArray(req.body?.engines)
     ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
     : []
+  const detected = req.body?.detected
   const hostName = typeof req.body?.hostName === 'string' ? req.body.hostName : undefined
   const version = typeof req.body?.version === 'string' ? req.body.version : undefined
   const supervised = typeof req.body?.supervised === 'boolean' ? req.body.supervised : undefined
@@ -1092,7 +1097,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   // its onboarding gate on that event and immediately reloads its roster, so the
   // starter team + "Everyone" group must already exist when it fires — otherwise
   // the user lands on an empty Conversations list that fills in a beat later.
-  const paired = await pairComputer({ code, hostName, engines, version, supervised, deferBroadcast: true })
+  const paired = await pairComputer({ code, hostName, engines, detected, version, supervised, deferBroadcast: true })
   if (!paired) throw new HttpError(400, 'invalid pairing token')
   // Free-tier BYOA onboarding on pair. The daemon sends the engines list with
   // the user's CHOSEN engine first (`cumora agent computer --pair … --engine X`),
@@ -1134,6 +1139,31 @@ api.post('/computers/pair', safe(async (req, res) => {
   // post-onboarding reload sees a fully-seeded workspace.
   await announceComputerOnline(paired.computerId, paired.companyId)
   res.json(paired)
+}))
+
+api.post('/computers/:id/detect', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const ok = await requestEngineDetect({ computerId: String(req.params.id), companyId })
+  if (!ok) throw new HttpError(404, 'computer not found')
+  res.json({ ok: true })
+}))
+
+api.post('/computers/:id/default-engine', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const engine = typeof req.body?.engine === 'string' ? req.body.engine : ''
+  const out = await setComputerDefaultEngine({ computerId: String(req.params.id), companyId, engine })
+  if (!out) throw new HttpError(400, 'engine is not installed on this computer')
+  res.json({ ok: true, ...out })
+}))
+
+api.post('/computers/me/engines', safe(async (req, res) => {
+  const { computerId } = await requireDevice(req)
+  const engines = Array.isArray(req.body?.engines)
+    ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
+    : []
+  const ok = await reportDetectedEngines({ computerId, engines, detected: req.body?.detected })
+  if (!ok) throw new HttpError(404, 'computer not found')
+  res.json({ ok: true })
 }))
 
 // Agents assigned to the calling computer (daemon discovery on boot).
@@ -1811,12 +1841,14 @@ api.get('/participants', async (req, res) => {
     email: string | null; companySlug: string | null
     departedAt: string | null
     computerId: string | null; engine: string | null; fastModel: string | null
+    engineInherit: boolean | null
   }>(
     `SELECT p.id, p.kind, p.name, p.role, p.initial,
             p.avatar_bg AS "avatarBg", p.avatar_url AS "avatarUrl",
             p.status, p.status_updated_at AS "statusUpdatedAt",
             p.bio, p.tools, p.system_prompt AS "systemPrompt", p.model,
             p.computer_id AS "computerId", p.engine, p.fast_model AS "fastModel",
+            p.engine_inherit AS "engineInherit",
             -- Email resolution differs by kind:
             --  - agents carry their own minted address on participants.email
             --  - humans don't have one there; surface their real auth email

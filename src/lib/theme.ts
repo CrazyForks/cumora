@@ -111,3 +111,15 @@ export const useAppearanceStore = create<AppearanceState>((set, get) => {
     },
   }
 })
+
+// The Electron notification panel is a second renderer. It boots its
+// own zustand copy from localStorage, then won't hear setAppearance
+// from the main window. `storage` fires in other windows only.
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key !== STORAGE_KEY) return
+    const next = isAppearance(e.newValue) ? e.newValue : 'system'
+    if (next === useAppearanceStore.getState().appearance) return
+    useAppearanceStore.getState().setAppearance(next)
+  })
+}
