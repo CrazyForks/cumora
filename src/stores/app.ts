@@ -1,5 +1,12 @@
 import { create } from 'zustand'
+import type { ApiAttachment } from '@/api/client'
 import type { ViewKey } from '@/types'
+import {
+  applyDraftUpdate, loadComposerDrafts, saveComposerDrafts,
+  type ComposerDraft,
+} from './composerDrafts'
+
+export type { ComposerDraft }
 
 interface AppState {
   view: ViewKey['view']
@@ -42,13 +49,25 @@ interface AppState {
   clearPendingJump: () => void
 
   /**
-   * Per-conversation composer text drafts. Mobile lives or dies by this:
-   * navigating from chat → list → chat unmounts MobileChat, which would
-   * blow away a local useState draft. We persist it here so a half-typed
-   * message survives the trip. Cleared on send.
+   * Composer drafts, keyed by composer SCOPE (a conversation id, or
+   * `<id>::thread::<rootId>` for the desktop thread drawer).
+   *
+   * Both shells route through here for the same reason: their composer is
+   * unmounted by ordinary navigation. Mobile loses MobileChat on chat → list
+   * → chat; desktop loses the whole ChatPane the moment `view` leaves
+   * `conversations`, because DesktopApp mounts views conditionally. Component
+   * state cannot survive either, so a half-typed message can't live there.
+   * The store is also mirrored to localStorage (see ./composerDrafts), so a
+   * reload or an app restart doesn't lose it either. Cleared on send, and on
+   * sign-out so drafts don't cross accounts on a shared device.
    */
-  composerDrafts: Record<string, string>
+  composerDrafts: Record<string, ComposerDraft>
+  /** Text-only convenience for the mobile composer. */
   setComposerDraft: (convoId: string, text: string) => void
+  /** Full read-modify-write, used by the desktop composer (which also carries
+   *  an attachment). The updater sees the current draft and returns the next. */
+  updateComposerDraft: (scope: string, updater: (current: ComposerDraft) => ComposerDraft) => void
+  clearComposerDrafts: () => void
 
   /**
    * Thread drawer state — when set, the right pane shows the thread view
@@ -124,12 +143,21 @@ export const useApp = create<AppState>((set) => ({
   jumpToMessage: (messageId) => set({ pendingJumpMessageId: messageId }),
   clearPendingJump: () => set({ pendingJumpMessageId: null }),
 
-  composerDrafts: {},
-  setComposerDraft: (convoId, text) => set((s) => {
-    const next = { ...s.composerDrafts }
-    if (text) next[convoId] = text
-    else delete next[convoId]
+  composerDrafts: loadComposerDrafts(),
+  updateComposerDraft: (scope, updater) => set((s) => {
+    const next = applyDraftUpdate(s.composerDrafts, scope, updater)
+    // applyDraftUpdate returns the same reference when nothing changed, which
+    // keeps this a no-op render AND avoids a pointless localStorage write.
+    if (next === s.composerDrafts) return s
+    saveComposerDrafts(next)
     return { composerDrafts: next }
+  }),
+  setComposerDraft: (convoId, text) => {
+    useApp.getState().updateComposerDraft(convoId, (current) => ({ ...current, text }))
+  },
+  clearComposerDrafts: () => set(() => {
+    saveComposerDrafts({})
+    return { composerDrafts: {} }
   }),
 
   openThread: null,

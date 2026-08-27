@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { useApp } from '@/stores/app'
+import { EMPTY_DRAFT, type ComposerDraft } from '@/stores/composerDrafts'
 import { useMe } from '@/stores/auth'
 import { useConversations } from '@/stores/conversations'
 import { useParticipants } from '@/stores/participants'
@@ -457,12 +458,11 @@ function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClos
   )
 }
 
-type ComposerDraftState = {
-  text: string
-  attachment: ApiAttachment | null
-}
+/** The draft shape is owned by the store — both shells and the persistence
+ *  layer have to agree on it, so it can't be redeclared here. */
+type ComposerDraftState = ComposerDraft
 
-const EMPTY_COMPOSER_DRAFT: ComposerDraftState = { text: '', attachment: null }
+const EMPTY_COMPOSER_DRAFT: ComposerDraftState = EMPTY_DRAFT
 
 function resolveDraftText(next: string | ((prev: string) => string), prev: string) {
   return typeof next === 'function' ? next(prev) : next
@@ -565,7 +565,13 @@ export function Composer({
   // Draft scope key — distinct namespace for thread mode so swapping between
   // the main composer and a thread drawer doesn't share text.
   const scopeKey = isThread ? `${convoId}::thread::${threadRootId}` : convoId
-  const [draftsByScope, setDraftsByScope] = useState<Record<string, ComposerDraftState>>({})
+  // Drafts live in the app store, not here. DesktopApp mounts views
+  // conditionally (`{view === 'conversations' && <ConversationsLayout />}`), so
+  // switching to Boards or Me unmounts this entire pane — component state
+  // would take the user's half-typed message with it. The store also mirrors
+  // to localStorage, so a reload doesn't lose it either.
+  const draftsByScope = useApp((s) => s.composerDrafts)
+  const updateDraftInStore = useApp((s) => s.updateComposerDraft)
   const [uploadingByScope, setUploadingByScope] = useState<Record<string, boolean>>({})
   const [uploadErrorsByScope, setUploadErrorsByScope] = useState<Record<string, string>>({})
   const editorRef = useRef<RichInputHandle>(null)
@@ -584,23 +590,15 @@ export function Composer({
   const uploading = Boolean(uploadingByScope[scopeKey])
   const uploadError = uploadErrorsByScope[scopeKey] ?? null
 
+  // Same signature as before; the empty-draft deletion and the
+  // nothing-changed short-circuit now live in the store so both shells share
+  // one definition of what a draft is.
   const updateComposerDraft = useCallback((
     targetScope: string,
     updater: (current: ComposerDraftState) => ComposerDraftState,
   ) => {
-    setDraftsByScope((prev) => {
-      const current = prev[targetScope] ?? EMPTY_COMPOSER_DRAFT
-      const next = updater(current)
-      if (next.text === current.text && next.attachment === current.attachment) return prev
-      if (next.text === '' && next.attachment === null) {
-        if (!prev[targetScope]) return prev
-        const copy = { ...prev }
-        delete copy[targetScope]
-        return copy
-      }
-      return { ...prev, [targetScope]: next }
-    })
-  }, [])
+    updateDraftInStore(targetScope, updater)
+  }, [updateDraftInStore])
 
   const setDraft = useCallback((nextText: string | ((prev: string) => string)) => {
     updateComposerDraft(scopeKey, (current) => ({

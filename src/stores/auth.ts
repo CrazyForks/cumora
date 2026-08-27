@@ -148,6 +148,11 @@ export const useAuth = create<AuthState>((set) => ({
     // dead URL.createObjectURL pointing at a freed blob.
     void import('@/lib/avatarCache').then(({ clearAvatarCache }) => clearAvatarCache())
     void import('@/api/client').then(({ ws }) => ws.close())
+    // Composer drafts outlive a session by design (they're mirrored to
+    // localStorage so a restart can't lose one), which means signing out has
+    // to drop them explicitly — otherwise a half-typed message would be
+    // waiting for whoever signs in next on a shared machine.
+    void import('./app').then(({ useApp }) => useApp.getState().clearComposerDrafts())
     // Library stores survive logout otherwise (they're global singletons).
     void Promise.all([
       import('./documents').then(({ useDocuments }) => useDocuments.getState().reset()),
