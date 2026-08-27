@@ -11,13 +11,25 @@
  * Kept in its own module so the policy — what a draft is, how many we keep,
  * how big the mirror may get — is testable without a store or a DOM.
  */
-import type { ApiAttachment } from '@/api/client'
+/** Structurally identical to `ApiAttachment` (src/api/client.ts), declared
+ *  here rather than imported so this module stays free of the `@/` alias and
+ *  of anything that drags the DOM in — that is what lets the policy be unit
+ *  tested from the server test runner. `assertDraftAttachmentMatchesApi` in
+ *  ./composerDraftsStorage fails the client build if the two ever drift. */
+export interface DraftAttachment {
+  url: string
+  name: string
+  kind: 'img' | 'pdf' | 'file' | 'fig'
+  mime?: string
+  size?: number
+  key?: string
+}
 
 export interface ComposerDraft {
   text: string
   /** An upload the user already paid for. Dropping it on navigation loses a
    *  file that is sitting in storage, so it rides along with the text. */
-  attachment: ApiAttachment | null
+  attachment: DraftAttachment | null
 }
 
 /** Keyed by composer SCOPE, not conversation: the desktop thread drawer is a
@@ -110,7 +122,7 @@ export function parseStoredDrafts(raw: string | null): ComposerDrafts {
   return evict(out)
 }
 
-function parseAttachment(value: unknown): ApiAttachment | null {
+function parseAttachment(value: unknown): DraftAttachment | null {
   if (!value || typeof value !== 'object') return null
   const a = value as Record<string, unknown>
   if (typeof a.url !== 'string' || typeof a.name !== 'string') return null
@@ -139,60 +151,4 @@ export function serializeDrafts(drafts: ComposerDrafts): string | null {
     delete copy[keys[0]]
     working = copy
   }
-}
-
-export function loadComposerDrafts(): ComposerDrafts {
-  if (typeof localStorage === 'undefined') return {}
-  try {
-    return parseStoredDrafts(localStorage.getItem(STORAGE_KEY))
-  } catch {
-    return {}
-  }
-}
-
-let flushTimer: ReturnType<typeof setTimeout> | null = null
-let pending: ComposerDrafts | null = null
-
-function writeNow(): void {
-  if (pending === null) return
-  const drafts = pending
-  pending = null
-  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null }
-  try {
-    if (Object.keys(drafts).length === 0) { localStorage.removeItem(STORAGE_KEY); return }
-    const json = serializeDrafts(drafts)
-    if (json === null) localStorage.removeItem(STORAGE_KEY)
-    else localStorage.setItem(STORAGE_KEY, json)
-  } catch {
-    /* private mode, quota, disabled storage — a lost mirror must never break typing */
-  }
-}
-
-/**
- * Mirror drafts to localStorage on a trailing debounce: typing fires this on
- * every keystroke, and a synchronous localStorage write per keystroke is a
- * jank source on long drafts. The `pagehide` flush below is what makes the
- * debounce safe — otherwise closing the window inside the window would lose
- * the very keystrokes this exists to protect.
- */
-export function saveComposerDrafts(drafts: ComposerDrafts): void {
-  if (typeof localStorage === 'undefined') return
-  pending = drafts
-  if (flushTimer) return
-  flushTimer = setTimeout(() => { flushTimer = null; writeNow() }, 400)
-}
-
-/** Write immediately — used by the unload hooks and by tests. */
-export function flushComposerDrafts(): void {
-  writeNow()
-}
-
-if (typeof window !== 'undefined') {
-  // `pagehide` fires on tab close, navigation and (unlike `beforeunload`)
-  // the iOS back/forward cache path. `visibilitychange` covers backgrounding
-  // the app without closing it, which is the common mobile case.
-  window.addEventListener('pagehide', flushComposerDrafts)
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushComposerDrafts()
-  })
 }

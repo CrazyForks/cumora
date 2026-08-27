@@ -1,10 +1,7 @@
 import { create } from 'zustand'
-import type { ApiAttachment } from '@/api/client'
 import type { ViewKey } from '@/types'
-import {
-  applyDraftUpdate, loadComposerDrafts, saveComposerDrafts,
-  type ComposerDraft,
-} from './composerDrafts'
+import { applyDraftUpdate, type ComposerDraft } from './composerDrafts'
+import { loadComposerDrafts, saveComposerDrafts } from './composerDraftsStorage'
 
 export type { ComposerDraft }
 
@@ -57,7 +54,8 @@ interface AppState {
    * → chat; desktop loses the whole ChatPane the moment `view` leaves
    * `conversations`, because DesktopApp mounts views conditionally. Component
    * state cannot survive either, so a half-typed message can't live there.
-   * The store is also mirrored to localStorage (see ./composerDrafts), so a
+   * The store is also mirrored to localStorage (see
+   * ./composerDraftsStorage), so a
    * reload or an app restart doesn't lose it either. Cleared on send, and on
    * sign-out so drafts don't cross accounts on a shared device.
    */
