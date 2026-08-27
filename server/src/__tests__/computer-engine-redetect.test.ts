@@ -1,0 +1,75 @@
+/**
+ * Re-detecting a paired computer's engines on the heartbeat.
+ *
+ * `available_engines[0]` is the computer's DEFAULT engine — pairComputer says so
+ * outright ("first = default") and it decides the engine for the starter team
+ * and for any agent assigned without an explicit override. So refreshing the
+ * list from a PATH scan must never reorder it silently, and must never let a
+ * daemon with a broken PATH wipe it.
+ *
+ * Run: node --import tsx --test server/src/__tests__/computer-engine-redetect.test.ts
+ */
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+
+// Same shape as agent-computer-pairing-token.test.ts: pin the HTTP runtime
+// client and import registry dynamically, so the test doesn't drag the in-proc
+// client's dependency graph into a unit run.
+process.env.CUMORA_RUNTIME_CLIENT = 'http'
+
+const { mergeDetectedEngines } = await import('../agents/computer/registry.js')
+
+test('a newly installed engine is appended without re-pairing', () => {
+  // The reported case: the user installs another CLI after pairing.
+  assert.deepEqual(
+    mergeDetectedEngines(['claude', 'codex'], ['claude', 'codex', 'cursor']),
+    ['claude', 'codex', 'cursor'],
+  )
+})
+
+test('the current default stays first even when detection orders it later', () => {
+  // detectEngines returns ENGINE_IDS order, which is NOT the user's choice.
+  // Overwriting with it would silently switch this computer's default engine.
+  assert.deepEqual(
+    mergeDetectedEngines(['codex', 'claude'], ['claude', 'codex', 'grok']),
+    ['codex', 'claude', 'grok'],
+  )
+})
+
+test('an uninstalled engine drops out, and the default moves on', () => {
+  // The default itself is gone — there is nothing to pin, so detection order wins.
+  assert.deepEqual(mergeDetectedEngines(['grok', 'claude'], ['claude', 'codex']), ['claude', 'codex'])
+})
+
+test('an unchanged list writes nothing', () => {
+  // The steady state: every heartbeat reports the same engines. Returning null
+  // keeps the 30s tick from issuing a pointless UPDATE forever.
+  assert.equal(mergeDetectedEngines(['claude', 'codex'], ['claude', 'codex']), null)
+})
+
+test('an empty detection never wipes the stored engines', () => {
+  // A broken PATH or a half-finished CLI upgrade must not un-assign every agent
+  // on the machine.
+  assert.equal(mergeDetectedEngines(['claude'], []), null)
+})
+
+test('a detection of only unknown ids is treated as empty', () => {
+  // A newer daemon reporting an engine this server has no adapter for must not
+  // clear the list either.
+  assert.equal(mergeDetectedEngines(['claude'], ['gemini', 'hermes']), null)
+})
+
+test('unknown ids are filtered out but known ones still apply', () => {
+  assert.deepEqual(
+    mergeDetectedEngines(['claude'], ['claude', 'gemini', 'opencode']),
+    ['claude', 'opencode'],
+  )
+})
+
+test('duplicates in a detection are collapsed', () => {
+  assert.deepEqual(mergeDetectedEngines(['claude'], ['claude', 'claude', 'codex']), ['claude', 'codex'])
+})
+
+test('a computer with no stored engines adopts the detection order', () => {
+  assert.deepEqual(mergeDetectedEngines([], ['claude', 'codex']), ['claude', 'codex'])
+})

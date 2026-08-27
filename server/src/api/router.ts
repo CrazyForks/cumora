@@ -1147,7 +1147,12 @@ api.post('/computers/heartbeat', safe(async (req, res) => {
   const { computerId } = await requireDevice(req)
   const version = typeof req.body?.version === 'string' ? req.body.version : undefined
   const supervised = typeof req.body?.supervised === 'boolean' ? req.body.supervised : undefined
-  await heartbeatComputer(computerId, version, supervised)
+  // Engines the daemon can currently see on PATH. Optional: an older daemon
+  // sends none and its stored list is left exactly as it was.
+  const engines = Array.isArray(req.body?.engines)
+    ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
+    : undefined
+  await heartbeatComputer(computerId, version, supervised, engines)
   res.json({ ok: true })
 }))
 

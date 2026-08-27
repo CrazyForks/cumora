@@ -47,6 +47,34 @@ export async function announceComputerOnline(computerId: string, companyId: stri
 /** Engines a paired (non-cloud) computer is allowed to advertise. */
 const PAIRABLE_ENGINES: ReadonlySet<string> = new Set(['claude', 'codex', 'grok', 'cursor', 'opencode'])
 
+/** Merge a fresh PATH detection into a computer's advertised engine list.
+ *
+ *  `available_engines[0]` is the computer's DEFAULT — pairComputer's comment
+ *  puts it plainly: "first = default", and it decides the engine for the starter
+ *  team and for any agent assigned without an explicit override. So a re-detect
+ *  must never reorder silently: if the current default is still installed it
+ *  stays first, and the rest follow detection order. Installing a new CLI adds
+ *  it to the tail; uninstalling one drops it.
+ *
+ *  Returns null when there is nothing to write — an empty or fully-unknown
+ *  detection, or a list identical to what is stored. A daemon that reports no
+ *  engines (a broken PATH, a half-finished upgrade) must NOT wipe a computer's
+ *  engines and un-assign every agent on it.
+ *
+ *  Exported for tests. */
+export function mergeDetectedEngines(current: string[], detected: string[]): string[] | null {
+  const fresh = detected.filter((e) => PAIRABLE_ENGINES.has(e))
+  if (fresh.length === 0) return null
+  const seen = new Set<string>()
+  const next: string[] = []
+  const currentDefault = current[0]
+  // Keep the default pinned to the front while it is still installed.
+  if (currentDefault && fresh.includes(currentDefault)) { next.push(currentDefault); seen.add(currentDefault) }
+  for (const e of fresh) { if (!seen.has(e)) { next.push(e); seen.add(e) } }
+  const same = next.length === current.length && next.every((e, i) => e === current[i])
+  return same ? null : next
+}
+
 export interface ComputerRow {
   id: string
   company_id: string
@@ -275,9 +303,34 @@ export async function pairComputer(args: {
 /** Daemon liveness ping. Bumps last_seen_at + the reported version; flips
  *  offline→online and broadcasts only on the transition (so a steady heartbeat
  *  is quiet). The version lets the app flag outdated daemons. */
-export async function heartbeatComputer(computerId: string, version?: string, supervised?: boolean): Promise<void> {
+export async function heartbeatComputer(
+  computerId: string,
+  version?: string,
+  supervised?: boolean,
+  detectedEngines?: string[],
+): Promise<void> {
   const v = typeof version === 'string' && version ? version.slice(0, 32) : null
   const sup = typeof supervised === 'boolean' ? supervised : null
+  // Keep the advertised engine list current WITHOUT a re-pair. The daemon is
+  // already online and re-scans PATH, so installing another supported CLI shows
+  // up here instead of requiring the user to mint a new pairing token. Only for
+  // paired computers: a cloud computer advertises 'managed' and has no PATH.
+  if (detectedEngines && detectedEngines.length > 0) {
+    const { rows } = await pool.query<{ available_engines: string[]; kind: ComputerKind }>(
+      `SELECT available_engines, kind FROM computers WHERE id = $1 AND revoked_at IS NULL`,
+      [computerId],
+    )
+    const row = rows[0]
+    if (row && row.kind !== 'cloud') {
+      const next = mergeDetectedEngines(row.available_engines ?? [], detectedEngines)
+      if (next) {
+        await pool.query(
+          `UPDATE computers SET available_engines = $2::jsonb WHERE id = $1 AND revoked_at IS NULL`,
+          [computerId, JSON.stringify(next)],
+        )
+      }
+    }
+  }
   const bumped = await pool.query(
     `UPDATE computers SET last_seen_at = NOW(), daemon_version = COALESCE($2, daemon_version),
             daemon_supervised = COALESCE($3, daemon_supervised)
