@@ -59,6 +59,11 @@ const DEFAULT_SERVER = process.env.CUMORA_SERVER_URL || 'https://api.cumora.ai'
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000 // refresh 5min before expiry
 const AGENT_POLL_MS = 60_000
 const HEARTBEAT_MS = 30_000
+// How often the daemon re-scans PATH for installed engines. Deliberately much
+// slower than the heartbeat: detection spawns a `which`/`where` per engine, and
+// nobody installs a CLI twice a minute. The heartbeat carries the CACHED result,
+// so the report costs nothing on the 30s tick.
+const ENGINE_RESCAN_MS = 5 * 60 * 1000
 // While an engine turn is in flight, bump the run's updated_at this often so the
 // server's 10-min stale-run sweeper doesn't false-positive a legitimately long
 // turn (a multi-hour Bash, a deep task) as "orphaned". 60s = 10× margin under the
@@ -2462,6 +2467,21 @@ async function doRun(serverOverride?: string): Promise<void> {
     }
   }
 
+  // Engines this machine can currently run, re-scanned on a slow timer. Reported
+  // on every heartbeat so installing another supported CLI takes effect without
+  // re-pairing — the daemon is already online and can see PATH itself, so there
+  // is no reason to make the user mint a new pairing token for it.
+  let detectedEngines: EngineId[] = await detectEngines()
+  const rescanEngines = async (): Promise<void> => {
+    try {
+      const next = await detectEngines()
+      if (next.length === 0) return  // broken PATH / mid-upgrade — keep the last good list
+      const changed = next.length !== detectedEngines.length || next.some((e, i) => e !== detectedEngines[i])
+      if (changed) console.log(`[computer] engines on PATH changed: ${detectedEngines.join(', ') || 'none'} → ${next.join(', ')}`)
+      detectedEngines = next
+    } catch { /* transient — the next tick retries */ }
+  }
+
   const heartbeat = async (): Promise<void> => {
     try {
       await fetch(`${cfg.serverUrl}/api/computers/heartbeat`, {
@@ -2473,7 +2493,7 @@ async function doRun(serverOverride?: string): Promise<void> {
         // `supervised` tells the server HOW this daemon runs (service vs. a
         // foreground command), so the app's upgrade banner can show the right
         // update instructions for this machine.
-        body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED }),
+        body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED, engines: detectedEngines }),
       })
     } catch { /* transient — next tick retries */ }
   }
@@ -2485,6 +2505,8 @@ async function doRun(serverOverride?: string): Promise<void> {
   }
   const poll = setInterval(() => { void sync() }, AGENT_POLL_MS)
   const beat = setInterval(() => { void heartbeat() }, HEARTBEAT_MS)
+  const rescan = setInterval(() => { void rescanEngines() }, ENGINE_RESCAN_MS)
+  rescan.unref?.()
   // Keep the service log from filling the disk: rotate at boot, then periodically.
   void rotateLogsIfNeeded()
   const logrot = setInterval(() => { void rotateLogsIfNeeded() }, LOG_ROTATE_MS)
@@ -2503,7 +2525,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   const shutdown = async (why: string): Promise<void> => {
     if (shuttingDown) return
     shuttingDown = true
-    clearInterval(poll); clearInterval(beat); clearInterval(logrot)
+    clearInterval(poll); clearInterval(beat); clearInterval(logrot); clearInterval(rescan)
     if (upd) clearInterval(upd)
     if (idleWatch) clearInterval(idleWatch)
     if (controlWatch) clearInterval(controlWatch)
