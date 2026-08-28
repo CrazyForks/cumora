@@ -9,7 +9,7 @@ const https = require('node:https')
 const crypto = require('node:crypto')
 const { pathToFileURL } = require('node:url')
 const autoUpdater = require('./autoUpdater.cjs')
-const { findWindowsCommand } = require('./cli-path.cjs')
+const { findWindowsCommand, windowsCommandInvocation } = require('./cli-path.cjs')
 
 const isDev = !app.isPackaged
 const DEV_URL = process.env.ELECTRON_RENDERER_URL || 'http://localhost:5180'
@@ -1495,9 +1495,13 @@ function detectSearchPath() {
 function spawnText(cmd, args, envPath, timeoutMs = 8000) {
   return new Promise((resolve) => {
     let settled = false
-    const child = spawn(cmd, args, {
+    const invocation = process.platform === 'win32'
+      ? windowsCommandInvocation(cmd, args)
+      : { command: cmd, args }
+    const child = spawn(invocation.command, invocation.args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, PATH: envPath ?? process.env.PATH },
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
     })
     let out = ''
     const onChunk = (buf) => { out += buf.toString('utf8') }
@@ -1611,7 +1615,7 @@ async function resolveCliPath(bin, envPath) {
     if (fromWhich) return fromWhich
   }
   const home = os.homedir()
-  const names = process.platform === 'win32' ? [bin, `${bin}.cmd`, `${bin}.exe`] : [bin]
+  const names = process.platform === 'win32' ? [`${bin}.cmd`, `${bin}.exe`, bin] : [bin]
   const dirs = [
     path.join(home, '.local', 'bin'),
     path.join(home, 'bin'),
