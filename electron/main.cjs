@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const { spawn } = require('node:child_process')
 const http = require('node:http')
+const https = require('node:https')
 const crypto = require('node:crypto')
 const { pathToFileURL } = require('node:url')
 const autoUpdater = require('./autoUpdater.cjs')
@@ -1393,19 +1394,84 @@ ipcMain.handle('app:is-focused', () => {
 
 // Keep in sync with src/lib/engines.ts. Official daemon detectEngines() only
 // probes engines with adapters (claude/cursor/codex/grok/opencode/pi). The rest
-// are listed so the Me page can show what is installed on THIS machine; they
-// cannot be assigned to people.
+// are listed so the Me page can diagnose what is installed on THIS machine.
 const LOCAL_CLIS = [
-  { id: 'claude', bin: 'claude' },
-  { id: 'cursor', bin: 'cursor-agent' },
-  { id: 'codex', bin: 'codex' },
-  { id: 'grok', bin: 'grok' },
-  { id: 'opencode', bin: 'opencode' },
-  { id: 'pi', bin: 'pi' },
-  { id: 'gemini', bin: 'gemini' },
-  { id: 'qwen', bin: 'qwen' },
-  { id: 'hermes', bin: 'hermes' },
+  {
+    id: 'claude', bin: 'claude', versionArgs: ['--version'],
+    npm: '@anthropic-ai/claude-code', brew: 'claude-code',
+    selfUpdate: 'claude update',
+  },
+  {
+    id: 'cursor', bin: 'cursor-agent', versionArgs: ['--version'], latestVia: 'cursor-about',
+    selfUpdate: 'cursor-agent update',
+  },
+  {
+    id: 'codex', bin: 'codex', versionArgs: ['--version'],
+    npm: '@openai/codex',
+  },
+  {
+    id: 'grok', bin: 'grok', versionArgs: ['--version'], latestVia: 'grok-check',
+    npm: '@xai-official/grok',
+    selfUpdate: 'grok update',
+  },
+  {
+    id: 'opencode', bin: 'opencode', versionArgs: ['--version'],
+    npm: 'opencode-ai',
+    selfUpdate: 'opencode upgrade',
+  },
+  {
+    id: 'pi', bin: 'pi', versionArgs: ['--version'],
+    npm: '@earendil-works/pi-coding-agent', npmFlags: '--ignore-scripts',
+    selfUpdate: 'pi update',
+  },
+  {
+    id: 'gemini', bin: 'gemini', versionArgs: ['--version'],
+    npm: '@google/gemini-cli', brew: 'gemini-cli',
+  },
+  {
+    id: 'qwen', bin: 'qwen', versionArgs: ['--version'],
+    npm: '@qwen-code/qwen-code',
+  },
+  {
+    id: 'hermes', bin: 'hermes', versionArgs: ['version'],
+    selfUpdate: 'hermes update',
+  },
 ]
+
+const NPM_LATEST_TTL_MS = 30 * 60 * 1000
+const npmLatestCache = new Map()
+
+function realpathOf(binPath) {
+  try {
+    return fs.realpathSync(binPath)
+  } catch {
+    return binPath
+  }
+}
+
+function isHomebrewInstall(binPath, real) {
+  const hay = `${binPath}\n${real}`
+  return /(^|[/\\])(Homebrew|homebrew|linuxbrew|Cellar)([/\\]|$)/i.test(hay)
+    || binPath.startsWith('/opt/homebrew/')
+}
+
+function npmUpdateCommand(spec) {
+  if (!spec.npm) return null
+  const flags = spec.npmFlags ? `${spec.npmFlags} ` : ''
+  return `npm install -g ${flags}${spec.npm}@latest`
+}
+
+// Prefer the CLI's own updater when it has one (`pi update`, `claude update`).
+// That path is what vendors document, and it works the same on Windows.
+// Only fall back to brew/npm when the binary has no self-update command.
+function inferUpdateCommand(spec, binPath) {
+  if (spec.selfUpdate) return spec.selfUpdate
+  const real = realpathOf(binPath)
+  if (spec.brew && isHomebrewInstall(binPath, real)) {
+    return `brew upgrade ${spec.brew}`
+  }
+  return npmUpdateCommand(spec)
+}
 
 function detectSearchPath() {
   const home = os.homedir()
@@ -1425,17 +1491,114 @@ function detectSearchPath() {
   return parts.join(path.delimiter)
 }
 
-function spawnText(cmd, args, envPath) {
+function spawnText(cmd, args, envPath, timeoutMs = 8000) {
   return new Promise((resolve) => {
+    let settled = false
     const child = spawn(cmd, args, {
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, PATH: envPath ?? process.env.PATH },
     })
     let out = ''
-    child.stdout?.on('data', (buf) => { out += buf.toString('utf8') })
-    child.on('error', () => resolve(''))
-    child.on('close', () => resolve(out.trim()))
+    const onChunk = (buf) => { out += buf.toString('utf8') }
+    child.stdout?.on('data', onChunk)
+    child.stderr?.on('data', onChunk)
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => { try { child.kill() } catch { /* ignore */ }; finish(out.trim()) }, timeoutMs)
+    child.on('error', () => finish(''))
+    child.on('close', () => finish(out.trim()))
   })
+}
+
+function parseCliVersion(text) {
+  if (!text) return null
+  const m = text.match(/v?(\d{4}\.\d{2}\.\d{2}(?:-[\w.]+)?|\d+\.\d+\.\d+(?:[-+][\w.]+)?)/i)
+  return m ? m[1] : null
+}
+
+function versionParts(v) {
+  const main = String(v).replace(/^v/i, '').split(/[-+]/)[0]
+  return main.split('.').map((n) => Number.parseInt(n, 10) || 0)
+}
+
+function isCliOutdated(current, latest) {
+  if (!current || !latest) return false
+  if (current === latest) return false
+  const a = versionParts(current)
+  const b = versionParts(latest)
+  const n = Math.max(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    if (y > x) return true
+    if (y < x) return false
+  }
+  return false
+}
+
+function fetchJson(url, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const req = https.get(url, {
+      headers: { 'User-Agent': 'cumora-desktop', Accept: 'application/json' },
+    }, (res) => {
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume()
+        fetchJson(res.headers.location, timeoutMs).then(resolve)
+        return
+      }
+      let body = ''
+      res.on('data', (chunk) => { body += chunk })
+      res.on('end', () => {
+        try { resolve(JSON.parse(body)) } catch { resolve(null) }
+      })
+    })
+    req.on('error', () => resolve(null))
+    req.setTimeout(timeoutMs, () => { req.destroy(); resolve(null) })
+  })
+}
+
+async function npmLatest(pkg) {
+  const cached = npmLatestCache.get(pkg)
+  if (cached && Date.now() - cached.at < NPM_LATEST_TTL_MS) return cached.version
+  const data = await fetchJson(`https://registry.npmjs.org/${encodeURIComponent(pkg)}/latest`)
+  const version = typeof data?.version === 'string' ? data.version : null
+  if (version) npmLatestCache.set(pkg, { at: Date.now(), version })
+  return version
+}
+
+function parseCursorAbout(text) {
+  const latestLine = text.split(/\r?\n/).find((line) => /^\s*Latest\b/i.test(line))
+  if (!latestLine) return null
+  return parseCliVersion(latestLine)
+}
+
+function parseGrokCheck(text) {
+  try {
+    const data = JSON.parse(text)
+    return typeof data.latestVersion === 'string' ? data.latestVersion : null
+  } catch {
+    return parseCliVersion(text)
+  }
+}
+
+async function detectCliLatest(spec, resolved, envPath) {
+  try {
+    if (spec.latestVia === 'cursor-about') {
+      const about = await spawnText(resolved, ['about'], envPath, 10000)
+      return parseCursorAbout(about) || parseCliVersion(about)
+    }
+    if (spec.latestVia === 'grok-check') {
+      const check = await spawnText(resolved, ['update', '--check', '--json'], envPath, 12000)
+      const fromCheck = parseGrokCheck(check)
+      if (fromCheck) return fromCheck
+    }
+    if (spec.npm) return await npmLatest(spec.npm)
+  } catch { /* keep local-only */ }
+  return null
 }
 
 async function resolveCliPath(bin, envPath) {
@@ -1480,11 +1643,26 @@ async function detectLocalHostNames() {
 ipcMain.handle('detect:local-clis', async () => {
   const envPath = detectSearchPath()
   const hostNames = await detectLocalHostNames()
-  const clis = []
-  for (const { id, bin } of LOCAL_CLIS) {
-    const resolved = await resolveCliPath(bin, envPath)
-    if (resolved) clis.push({ id, bin, path: resolved })
+  const found = []
+  for (const spec of LOCAL_CLIS) {
+    const resolved = await resolveCliPath(spec.bin, envPath)
+    if (resolved) found.push({ spec, path: resolved })
   }
+  const clis = await Promise.all(found.map(async ({ spec, path: resolved }) => {
+    const rawVersion = await spawnText(resolved, spec.versionArgs, envPath, 6000)
+    const version = parseCliVersion(rawVersion)
+    const latest = await detectCliLatest(spec, resolved, envPath)
+    const outdated = isCliOutdated(version, latest)
+    return {
+      id: spec.id,
+      bin: spec.bin,
+      path: resolved,
+      version,
+      latest,
+      outdated,
+      updateCommand: outdated ? inferUpdateCommand(spec, resolved) : null,
+    }
+  }))
   return { hostNames, clis }
 })
 

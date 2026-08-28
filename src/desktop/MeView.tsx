@@ -771,7 +771,15 @@ function SkypeSoundSection() {
 const KIND_ICON: Record<string, string> = { cloud: '☁', local: '💻', vps: '🖥' }
 const STATUS_COLOR: Record<string, string> = { online: '#3BB273', busy: '#E6A23C', offline: 'var(--ink-300)' }
 
-type AgentRow = { id: string; bin: string; path: string | null }
+type AgentRow = {
+  id: string
+  bin: string
+  path: string | null
+  version?: string | null
+  latest?: string | null
+  outdated?: boolean
+  updateCommand?: string | null
+}
 
 const CLI_ORDER = [
   'claude', 'cursor', 'codex', 'grok', 'opencode',
@@ -805,7 +813,15 @@ function isThisMachine(computer: Computer, hostNames: string[], localComputerCou
 
 function mergeAgentRows(
   computer: Computer,
-  localClis: Array<{ id: string; bin: string; path: string }> | null,
+  localClis: Array<{
+    id: string
+    bin: string
+    path: string
+    version?: string | null
+    latest?: string | null
+    outdated?: boolean
+    updateCommand?: string | null
+  }> | null,
   thisMachine: boolean,
 ): AgentRow[] {
   const byId = new Map<string, AgentRow>()
@@ -845,17 +861,34 @@ function ComputersTab() {
   const [repairCode, setRepairCode] = useState<string | null>(null)
   const [repairCopied, setRepairCopied] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [copiedCli, setCopiedCli] = useState<string | null>(null)
   const [localDetect, setLocalDetect] = useState<{
     hostNames: string[]
-    clis: Array<{ id: string; bin: string; path: string }>
+    clis: Array<{
+      id: string
+      bin: string
+      path: string
+      version?: string | null
+      latest?: string | null
+      outdated?: boolean
+      updateCommand?: string | null
+    }>
   } | null>(null)
+  const canDetectLocal = typeof window !== 'undefined' && typeof window.cumora?.detect?.localClis === 'function'
+  const [cliScanning, setCliScanning] = useState(canDetectLocal)
 
   async function scanLocal() {
     const fn = typeof window !== 'undefined' ? window.cumora?.detect?.localClis : undefined
-    if (!fn) return
+    if (!fn) {
+      setCliScanning(false)
+      return
+    }
+    setCliScanning(true)
     try {
       setLocalDetect(await fn())
-    } catch { /* keep previous */ }
+    } catch { /* keep previous */ } finally {
+      setCliScanning(false)
+    }
   }
 
   useEffect(() => {
@@ -863,6 +896,7 @@ function ComputersTab() {
     void scanLocal()
   }, [])
   useEffect(() => { if (!repairCopied) return; const id = window.setTimeout(() => setRepairCopied(false), 1600); return () => window.clearTimeout(id) }, [repairCopied])
+  useEffect(() => { if (!copiedCli) return; const id = window.setTimeout(() => setCopiedCli(null), 1600); return () => window.clearTimeout(id) }, [copiedCli])
 
   async function toggleRepair(id: string) {
     if (repairFor === id) { setRepairFor(null); setRepairCode(null); return }
@@ -947,10 +981,11 @@ function ComputersTab() {
             const expanded = repairFor === c.id
             const repairCmd = repairCode ? `npx cumora@latest agent computer --pair ${repairCode}${serverFlag}` : ''
             const thisMachine = isThisMachine(c, localDetect?.hostNames ?? [], localComputerCount)
-            const rows = repairable
+            const awaitingCli = repairable && c.kind === 'local' && cliScanning
+            const rows = repairable && !awaitingCli
               ? mergeAgentRows(c, thisMachine ? (localDetect?.clis ?? null) : null, thisMachine)
               : []
-            const detecting = busyId === c.id
+            const detecting = busyId === c.id || awaitingCli
             return (
               <div key={c.id} className="bg-cloud rounded-[14px]" style={{ border: '1px solid var(--ink-100)' }}>
                 <div
@@ -972,14 +1007,22 @@ function ComputersTab() {
                         </span>
                       )}
                     </div>
-                    <div className="text-[12px] text-ink-500 mt-0.5">
+                    <div className="flex items-center text-[12px] text-ink-500 mt-0.5">
                       {repairable
                         ? (
                           <>
-                            {n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n })}
-                            {rows.length > 0 && <>{' · '}{t('me.agentsDetected', { n: rows.length })}</>}
+                            <span>
+                              {awaitingCli
+                                ? t('me.agentsDiagnosing')
+                                : rows.length > 0
+                                  ? (rows.length === 1 ? t('me.agentsCliDetectedOne', { n: rows.length }) : t('me.agentsCliDetectedOther', { n: rows.length }))
+                                  : (n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n }))}
+                            </span>
                             {c.daemonVersion && (
-                              <>{' · '}<span className="font-mono text-[11px] text-ink-400">{t('me.daemonVersion', { version: c.daemonVersion })}</span></>
+                              <>
+                                <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
+                                <span>{t('me.daemonVersionLocal', { version: c.daemonVersion })}</span>
+                              </>
                             )}
                           </>
                         )
@@ -1006,27 +1049,88 @@ function ComputersTab() {
                   )}
                 </div>
                 {repairable && (
-                  rows.length === 0 ? (
+                  awaitingCli ? (
+                    <div className="px-4 pb-4 space-y-2" aria-busy="true">
+                      <div className="text-[12px] text-ink-500">{t('me.agentsDiagnosing')}</div>
+                      {[0, 1, 2].map((i) => (
+                        <div
+                          key={i}
+                          className="rounded-[12px] px-3 py-2.5 bg-paper"
+                          style={{ border: '1px solid var(--ink-200)' }}
+                        >
+                          <div className="h-3.5 w-24 rounded-md bg-ink-200" />
+                          <div className="mt-2 h-2.5 w-[70%] rounded-md bg-ink-200/80" />
+                        </div>
+                      ))}
+                    </div>
+                  ) : rows.length === 0 ? (
                     <div className="px-4 pb-4 text-[12px] text-ink-400">{t('me.agentsNoEngines')}</div>
                   ) : (
                     <div className="px-4 pb-4 space-y-2">
                       {rows.map((row) => {
                         const engineId = asRunnableEngine(row.id)
-                        const advertised = engineId != null && c.availableEngines.includes(engineId)
-                        const isDefault = advertised && row.id === c.availableEngines[0]
+                        const copyKey = `${c.id}:${row.id}`
                         return (
-                          <div key={row.id} className="flex items-center gap-3 rounded-[12px] px-3 py-2.5"
+                          <div key={row.id} className="rounded-[12px] px-3 py-2.5"
                             style={{ border: '1px solid var(--ink-100)' }}>
-                            <div className="flex-1 min-w-0">
-                              <div className="text-[13px] font-semibold text-ink-900">{engineLabel(row.id)}</div>
-                              <div className="font-mono text-[11px] text-ink-400 truncate">
-                                {row.bin}{row.path ? ` · ${row.path}` : ''}
+                            <div className="flex items-start gap-3">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <div className="text-[13px] font-semibold text-ink-900 shrink-0">{engineLabel(row.id)}</div>
+                                  {row.outdated && (
+                                    <span
+                                      className="text-[12px] font-semibold px-2 py-0.5 rounded-full shrink-0 bg-gold/20 text-gold-deep"
+                                    >
+                                      {t('me.agentsCliUpdateAvailable')}
+                                    </span>
+                                  )}
+                                  {!engineId && (
+                                    <span className="text-[12px] text-ink-400 truncate">{t('me.agentsNotRunnable')}</span>
+                                  )}
+                                </div>
+                                <div className="mt-1 flex items-center min-w-0 font-mono text-[12px] text-ink-400">
+                                  <span className="shrink-0">{row.bin}</span>
+                                  {row.path && (
+                                    <>
+                                      <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
+                                      <span className="truncate">{row.path}</span>
+                                    </>
+                                  )}
+                                </div>
+                                {(row.version || row.latest) && (
+                                  <div className="mt-1 flex items-center text-[12px] text-ink-500">
+                                    <span>{row.version ? t('me.agentsCliLocal', { version: row.version }) : t('me.agentsCliUnknown')}</span>
+                                    {row.latest && (
+                                      <>
+                                        <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
+                                        <span>{t('me.agentsCliLatest', { latest: row.latest })}</span>
+                                      </>
+                                    )}
+                                    {!row.outdated && row.latest && row.version === row.latest && (
+                                      <>
+                                        <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
+                                        <span>{t('me.agentsCliCurrent')}</span>
+                                      </>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             </div>
-                            {isDefault ? (
-                              <span className="text-[12px] font-semibold text-skype-deep">✓ {t('me.agentsIsDefault')}</span>
-                            ) : engineId ? null : (
-                              <span className="text-[11px] text-ink-400 shrink-0">{t('me.agentsNotRunnable')}</span>
+                            {row.updateCommand && (
+                              <div className="mt-2 flex items-center gap-2">
+                                <pre className="flex-1 min-w-0 font-mono text-[11px] truncate bg-ink-900 text-cloud rounded-[8px] px-2 py-1.5 select-all">{row.updateCommand}</pre>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    void navigator.clipboard?.writeText(row.updateCommand!)
+                                    setCopiedCli(copyKey)
+                                  }}
+                                  className="text-[12px] font-semibold text-skype-deep hover:underline shrink-0"
+                                >
+                                  {copiedCli === copyKey ? t('me.copied') : t('me.agentsCopyUpdate')}
+                                </button>
+                              </div>
                             )}
                           </div>
                         )

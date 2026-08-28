@@ -89,7 +89,15 @@ interface CumoraBridge {
   detect?: {
     localClis: () => Promise<{
       hostNames: string[]
-      clis: Array<{ id: string; bin: string; path: string }>
+      clis: Array<{
+        id: string
+        bin: string
+        path: string
+        version?: string | null
+        latest?: string | null
+        outdated?: boolean
+        updateCommand?: string | null
+      }>
     }>
   }
   /** Auto-update bridge — ported from alma's pattern. Surfaces
