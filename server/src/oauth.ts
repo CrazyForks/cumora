@@ -41,7 +41,20 @@ import { storage } from './storage.js'
 import { provisionUser as provisionSub2apiUser, sub2apiConfigured } from './sub2api.js'
 import { isWaitlistEnabled, enqueueWaitlist, isAllowlistedAdmin } from './admin.js'
 
-export type Provider = 'google' | 'github' | 'apple'
+export type Provider = 'google' | 'github' | 'gitlab' | 'apple'
+
+/** Providers reachable through the BROWSER redirect flow (/auth/start/:provider
+ *  → /auth/callback/:provider). Apple is deliberately absent: it signs in
+ *  natively through /auth/apple/native and never goes through these routes.
+ *
+ *  One set rather than a `!== 'google' && !== 'github'` chain at each gate —
+ *  those have to be found and widened by hand for every new provider, and a
+ *  missed one fails as a 404 on a button the UI already renders. */
+export const WEB_OAUTH_PROVIDERS: ReadonlySet<string> = new Set(['google', 'github', 'gitlab'])
+
+export function isWebOAuthProvider(p: string): p is Provider {
+  return WEB_OAUTH_PROVIDERS.has(p)
+}
 
 interface ProviderConfig {
   authorizeUrl: string
@@ -60,6 +73,22 @@ function providerConfig(p: Provider): ProviderConfig {
     scope:        'openid email profile',
     clientId:     env.GOOGLE_CLIENT_ID,
     clientSecret: env.GOOGLE_CLIENT_SECRET,
+  }
+  if (p === 'gitlab') {
+    // Endpoints are derived from GITLAB_BASE_URL so a self-managed instance
+    // works with the same code path as gitlab.com. `read_user` is the scope
+    // that grants the `/api/v4/user` profile read we need — deliberately the
+    // narrowest one: `api` would hand us write access to the user's repos for
+    // no reason.
+    const base = env.GITLAB_BASE_URL
+    return {
+      authorizeUrl: `${base}/oauth/authorize`,
+      tokenUrl:     `${base}/oauth/token`,
+      userInfoUrl:  `${base}/api/v4/user`,
+      scope:        'read_user',
+      clientId:     env.GITLAB_CLIENT_ID,
+      clientSecret: env.GITLAB_CLIENT_SECRET,
+    }
   }
   return {
     authorizeUrl: 'https://github.com/login/oauth/authorize',
@@ -128,7 +157,7 @@ export async function consumeState(state: string): Promise<StateData | null> {
   if (!v) return null
   try {
     const parsed = JSON.parse(v) as StateData
-    if (parsed.provider !== 'google' && parsed.provider !== 'github') return null
+    if (!isWebOAuthProvider(parsed.provider)) return null
     return parsed
   } catch {
     return null
@@ -184,6 +213,18 @@ async function exchangeCode(p: Provider, code: string): Promise<string> {
 
 interface GoogleProfile { sub: string; email?: string; email_verified?: boolean; name?: string; picture?: string }
 interface GitHubProfile { id: number; login: string; name?: string | null; email?: string | null; avatar_url?: string }
+/** GitLab `GET /api/v4/user` (the authenticated user). `confirmed_at` is the
+ *  field that attests the address: GitLab sets it when the user completes email
+ *  confirmation, and leaves it null otherwise. */
+interface GitLabProfile {
+  id: number
+  username: string
+  name?: string | null
+  email?: string | null
+  state?: string | null
+  confirmed_at?: string | null
+  avatar_url?: string | null
+}
 interface GitHubEmail   { email: string; primary: boolean; verified: boolean }
 
 export async function fetchProfile(p: Provider, accessToken: string): Promise<NormalizedProfile> {
@@ -198,6 +239,33 @@ export async function fetchProfile(p: Provider, accessToken: string): Promise<No
       email: g.email.toLowerCase(),
       displayName: (g.name && g.name.trim()) || g.email.split('@')[0]!,
       avatarUrl: g.picture ?? null,
+    }
+  }
+  if (p === 'gitlab') {
+    const r = await fetch(cfg.userInfoUrl, {
+      headers: { authorization: `Bearer ${accessToken}`, accept: 'application/json' },
+    })
+    if (!r.ok) throw new Error(`gitlab user ${r.status}`)
+    const g = await r.json() as GitLabProfile
+    // The email must be ATTESTED, not merely present. NormalizedProfile.email
+    // feeds findOrCreateUserByProfile's cross-provider auto-link, which links a
+    // new identity onto an existing account purely by matching address — so an
+    // unattested address here would be an account-takeover primitive, not a
+    // cosmetic gap. Google gates on email_verified and GitHub on the address
+    // being `verified`; GitLab's equivalent is confirmed_at.
+    //
+    // Both checks are required. A self-managed instance can be configured with
+    // user confirmation disabled, in which case confirmed_at stays null even
+    // for an active account — refuse rather than trust it. `state` catches
+    // accounts that are blocked/deactivated but still hold a live token.
+    if (g.state !== 'active') throw new Error('gitlab account is not active')
+    if (!g.confirmed_at) throw new Error('gitlab account has no confirmed email')
+    if (!g.email) throw new Error('gitlab account exposes no email to read_user')
+    return {
+      providerId: String(g.id),
+      email: g.email.toLowerCase(),
+      displayName: (g.name && g.name.trim()) || g.username,
+      avatarUrl: g.avatar_url ?? null,
     }
   }
   // GitHub: /user doesn't expose email when the user hides it. Hit /user/emails

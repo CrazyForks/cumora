@@ -765,7 +765,7 @@ export const api = {
    *  `window.location.assign(api.authStartUrl('google'))` rather than
    *  fetch — the browser needs to do the actual navigation so the
    *  callback can land back on AUTH_DONE_URL with the session token. */
-  authStartUrl: (provider: 'google' | 'github', opts?: { inviteToken?: string | null; returnUrl?: string | null }) => {
+  authStartUrl: (provider: 'google' | 'github' | 'gitlab', opts?: { inviteToken?: string | null; returnUrl?: string | null }) => {
     const params = new URLSearchParams()
     if (opts?.returnUrl) params.set('return', opts.returnUrl)
     if (opts?.inviteToken) params.set('invite', opts.inviteToken)
@@ -1236,6 +1236,9 @@ export const api = {
     http<ApiConveneSession | null>(`/conversations/${encodeURIComponent(conversationId)}/convene`),
   getConveneTranscript: (sessionId: string) =>
     http<ApiConveneTranscript[]>(`/convene/${encodeURIComponent(sessionId)}/transcript`),
+  /** Browser sign-in providers this deployment has credentials for. Used to
+   *  avoid rendering a button that can only 503. */
+  authProviders: () => http<{ providers: string[] }>('/auth/providers'),
   getPreferences: () => http<Record<string, unknown>>('/me/preferences'),
   putPreferences: (prefs: Record<string, unknown>) =>
     http<{ ok: boolean }>('/me/preferences', { method: 'PUT', body: JSON.stringify(prefs) }),

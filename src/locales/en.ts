@@ -62,6 +62,7 @@ export const en = {
   'auth.continueWithApple': 'Continue with Apple',
   'auth.continueWithGoogle': 'Continue with Google',
   'auth.continueWithGithub': 'Continue with GitHub',
+  'auth.continueWithGitlab': 'Continue with GitLab',
   'auth.signInToAccept': 'Sign in to accept this invite',
   // Local email + password — self-hosted servers with no OAuth provider.
   // ─── web landing (app.cumora.ai) ──────────────────────────────────

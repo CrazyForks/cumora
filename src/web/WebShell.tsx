@@ -109,9 +109,20 @@ function WebHandoff() {
  *  or as a suspended verdict (→ SuspendedScreen, also App.tsx). */
 function WebLanding() {
   const t = useT()
-  const [busy, setBusy] = useState<'google' | 'github' | null>(null)
+  const [busy, setBusy] = useState<'google' | 'github' | 'gitlab' | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  // Same gating as AuthScreen: GitLab is opt-in, so only offer it when this
+  // deployment actually has credentials for it.
+  const [gitlabEnabled, setGitlabEnabled] = useState(false)
   const approvedEntry = new URLSearchParams(location.search).has('approved')
+
+  useEffect(() => {
+    let cancelled = false
+    void api.authProviders()
+      .then((r) => { if (!cancelled) setGitlabEnabled(r.providers.includes('gitlab')) })
+      .catch(() => { /* older server or offline — leave the button hidden */ })
+    return () => { cancelled = true }
+  }, [])
 
   useEffect(() => {
     const params = new URLSearchParams(location.hash.replace(/^#/, ''))
@@ -119,7 +130,7 @@ function WebLanding() {
     if (error) setErr(decodeURIComponent(error))
   }, [])
 
-  const go = (provider: 'google' | 'github') => {
+  const go = (provider: 'google' | 'github' | 'gitlab') => {
     setBusy(provider); setErr(null)
     const returnUrl = `${location.origin}${location.pathname}`
     location.assign(api.authStartUrl(provider, { returnUrl }))
@@ -157,6 +168,17 @@ function WebLanding() {
             <GitHubMark />
             {busy === 'github' ? t('auth.redirecting') : t('auth.continueWithGithub')}
           </button>
+          {gitlabEnabled && (
+            <button
+              type="button"
+              onClick={() => go('gitlab')}
+              disabled={busy !== null}
+              className="h-11 rounded-[10px] bg-[#fc6d26] hover:bg-[#e24329] text-white transition-colors flex items-center justify-center gap-3 text-[14px] disabled:opacity-60"
+            >
+              <GitLabMark />
+              {busy === 'gitlab' ? t('auth.redirecting') : t('auth.continueWithGitlab')}
+            </button>
+          )}
         </div>
         {err && (
           <div className="text-[12px] text-red-600 text-center max-w-full break-words">
@@ -197,6 +219,14 @@ function GoogleMark() {
       <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
       <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
       <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+    </svg>
+  )
+}
+
+function GitLabMark() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 21.4 8.7 11.2H15.3L12 21.4zM3.6 11.2 2.3 15.3a.9.9 0 0 0 .33 1L12 21.4 3.6 11.2zM3.6 11.2h5.1L6.5 4.4a.45.45 0 0 0-.86 0L3.6 11.2zM20.4 11.2l1.3 4.1a.9.9 0 0 1-.33 1L12 21.4l8.4-10.2zM20.4 11.2h-5.1l2.2-6.8a.45.45 0 0 1 .86 0l2.04 6.8z" />
     </svg>
   )
 }
