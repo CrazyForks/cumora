@@ -9,6 +9,7 @@ import { IPlus } from '@/components/icons'
 import { AgentEditor } from '@/components/AgentEditor'
 import { api } from '@/api/client'
 import { useT, type MessageKey } from '@/lib/i18n'
+import { engineLabel } from '@/lib/engines'
 import type { Participant } from '@/types'
 
 const STATUS_LABEL_KEY: Record<string, MessageKey> = {
@@ -35,6 +36,13 @@ function AgentCard({ p, onEdit, onDelete }: {
   const displayStatusLabel = hostOffline
     ? t('agents.statusOffline')
     : t((STATUS_LABEL_KEY[p.status] ?? 'common.idle') as MessageKey)
+  const engineName = (() => {
+    if (!host || host.kind === 'cloud') return null
+    const id = p.engine && p.engine !== 'managed'
+      ? p.engine
+      : (host.availableEngines[0] ?? null)
+    return id ? engineLabel(id) : null
+  })()
   const direct = useMemo(
     () => conversations.find((c) => c.kind === 'direct' && c.members.includes(p.id)),
     [conversations, p.id],
@@ -93,8 +101,8 @@ function AgentCard({ p, onEdit, onDelete }: {
         <div className="flex-1 min-w-0">
           <h3 className="font-display font-medium text-[20px] tracking-tight leading-tight">{p.name}</h3>
           <div className="font-display italic font-normal text-[12.5px] text-ink-500 mb-1.5">{p.role}</div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold py-0.5 px-2 rounded-full"
+          <div className="flex flex-nowrap items-center gap-1.5 min-w-0">
+            <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold py-0.5 px-2 rounded-full shrink-0"
               style={{
                 background: `${STATUS_COLOR[displayStatus]}1F`,
                 color: STATUS_COLOR[displayStatus],
@@ -102,13 +110,22 @@ function AgentCard({ p, onEdit, onDelete }: {
               <span className="w-1.5 h-1.5 rounded-full" style={{ background: STATUS_COLOR[displayStatus] }} />
               {displayStatusLabel}
             </div>
-            <div className="inline-flex items-center gap-1 text-[11px] py-0.5 px-2 rounded-full text-ink-500"
+            <div className="inline-flex items-center gap-1 min-w-0 overflow-hidden text-[11px] py-0.5 px-2 rounded-full text-ink-500"
               style={{ background: 'var(--ink-100)' }}
               title={hostOffline ? t('agents.hostOfflineTip', { host: hostLabel }) : t('agents.hostRunsOn', { host: hostLabel })}>
-              <span>{hostIcon}</span>
-              <span className="max-w-[120px] truncate">{hostLabel}</span>
-              {hostOffline && <span className="italic text-ink-400">{t('agents.hostOfflineSuffix')}</span>}
+              <span className="shrink-0">{hostIcon}</span>
+              <span className="min-w-0 truncate">{hostLabel}</span>
+              {hostOffline && <span className="italic text-ink-400 shrink-0">{t('agents.hostOfflineSuffix')}</span>}
             </div>
+            {engineName && (
+              <div
+                className="inline-flex items-center text-[11px] py-0.5 px-2 rounded-full text-ink-700 shrink-0 whitespace-nowrap"
+                style={{ background: 'var(--ink-100)' }}
+                title={t('agents.hostEngineTip', { engine: engineName })}
+              >
+                {engineName}
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -140,6 +157,31 @@ function AgentCard({ p, onEdit, onDelete }: {
           {t('agents.cardWhisper')}
         </button>
       </div>
+    </div>
+  )
+}
+
+function AgentCardSkeleton() {
+  return (
+    <div
+      className="rounded-[16px] p-5 min-h-[280px] bg-cloud"
+      style={{ border: '1px solid var(--ink-200)' }}
+    >
+      <div className="flex items-start gap-3.5 mb-3">
+        <div className="w-14 h-14 rounded-full bg-ink-200 shrink-0" />
+        <div className="flex-1 pt-1">
+          <div className="h-5 w-28 rounded-md bg-ink-200" />
+          <div className="mt-2 h-3 w-20 rounded-md bg-ink-200/80" />
+          <div className="mt-2.5 flex gap-1.5">
+            <div className="h-5 w-14 rounded-full bg-ink-200/80" />
+            <div className="h-5 w-24 rounded-full bg-ink-200/80" />
+            <div className="h-5 w-16 rounded-full bg-ink-200/80" />
+          </div>
+        </div>
+      </div>
+      <div className="h-3 w-[92%] rounded-md bg-ink-200/70 mb-2" />
+      <div className="h-3 w-[70%] rounded-md bg-ink-200/70 mb-4" />
+      <div className="mt-auto h-9 rounded-[9px] bg-ink-200/80" />
     </div>
   )
 }
@@ -181,8 +223,6 @@ function ConfirmOffboard({ p, onCancel, onConfirmed }: {
     setBusy(true); setErr(null)
     try {
       await api.offboardAgent(p.id)
-      await useParticipants.getState().load()
-      await useConversations.getState().reload()
       onConfirmed()
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
@@ -269,14 +309,26 @@ export function AgentsView() {
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<Participant | null>(null)
   const [confirmingOffboard, setConfirmingOffboard] = useState<Participant | null>(null)
+  const [rosterBusy, setRosterBusy] = useState(false)
+
+  async function reloadRoster() {
+    setRosterBusy(true)
+    try {
+      await Promise.all([
+        useParticipants.getState().refresh(),
+        useConversations.getState().reload(),
+      ])
+    } finally {
+      setRosterBusy(false)
+    }
+  }
 
   const openCreate = () => { setEditing(null); setEditorOpen(true) }
   const openEdit = (p: Participant) => { setEditing(p); setEditorOpen(true) }
   const rehire = async (p: Participant) => {
     try {
       await api.rehireAgent(p.id)
-      await useParticipants.getState().load()
-      await useConversations.getState().reload()
+      await reloadRoster()
     } catch (e) {
       console.warn('[rehire] failed', e)
     }
@@ -323,11 +375,22 @@ export function AgentsView() {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {list.map((a) => (
-            <AgentCard key={a.id} p={a} onEdit={openEdit} onDelete={setConfirmingOffboard} />
-          ))}
-          <HireCard onClick={openCreate} />
+        {rosterBusy && (
+          <div className="text-[12px] text-ink-500 mb-3">{t('agents.rosterRefreshing')}</div>
+        )}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" aria-busy={rosterBusy}>
+          {rosterBusy ? (
+            Array.from({ length: Math.max(list.length, 3) + 1 }, (_, i) => (
+              <AgentCardSkeleton key={i} />
+            ))
+          ) : (
+            <>
+              {list.map((a) => (
+                <AgentCard key={a.id} p={a} onEdit={openEdit} onDelete={setConfirmingOffboard} />
+              ))}
+              <HireCard onClick={openCreate} />
+            </>
+          )}
         </div>
 
         {departed.length > 0 && (
@@ -370,13 +433,20 @@ export function AgentsView() {
       </div>
 
       {editorOpen && (
-        <AgentEditor agent={editing} onClose={() => { setEditorOpen(false); setEditing(null) }} />
+        <AgentEditor
+          agent={editing}
+          onClose={() => { setEditorOpen(false); setEditing(null) }}
+          onSaved={() => { void reloadRoster() }}
+        />
       )}
       {confirmingOffboard && (
         <ConfirmOffboard
           p={confirmingOffboard}
           onCancel={() => setConfirmingOffboard(null)}
-          onConfirmed={() => setConfirmingOffboard(null)}
+          onConfirmed={() => {
+            setConfirmingOffboard(null)
+            void reloadRoster()
+          }}
         />
       )}
     </main>

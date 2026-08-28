@@ -37,9 +37,11 @@ interface Props {
   /** if provided, edit mode; otherwise create mode */
   agent: Participant | null
   onClose: () => void
+  /** Called after a successful save, once the modal is already closed. */
+  onSaved?: () => void
 }
 
-export function AgentEditor({ agent, onClose }: Props) {
+export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const t = useT()
   const editing = agent !== null
   const [name, setName] = useState(agent?.name ?? '')
@@ -173,9 +175,13 @@ export function AgentEditor({ agent, onClose }: Props) {
           throw new Error(t('agent.enginePinRejected', { engine: engineLabel(pinned) }))
         }
       }
-      await useParticipants.getState().load()
-      await useConversations.getState().reload()
       onClose()
+      if (onSaved) {
+        onSaved()
+      } else {
+        void useParticipants.getState().refresh()
+        void useConversations.getState().reload()
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -194,7 +200,7 @@ export function AgentEditor({ agent, onClose }: Props) {
       await api.updateAgent(agent.id, { name, role, systemPrompt, bio, avatarBg })
       const r = await api.generateAgentAvatar(agent.id)
       setAvatarUrl(r.url)
-      await useParticipants.getState().load()
+      await useParticipants.getState().refresh()
     } catch (e) {
       setAvatarErr(e instanceof Error ? e.message : String(e))
     } finally {
