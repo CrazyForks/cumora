@@ -19,7 +19,7 @@ import {
 } from '../auth.js'
 import { joinAllHands, onboardStarterAgents, seedMemberDms } from '../onboardCompany.js'
 import {
-  type Provider, providerEnabled, createState, consumeState,
+  type Provider, providerEnabled, createState, consumeState, isWebOAuthProvider, WEB_OAUTH_PROVIDERS,
   authorizeUrl, handleCallback, errorUrl, returnUrlAllowed,
 } from '../oauth.js'
 import { adminRouter } from './admin-router.js'
@@ -651,9 +651,17 @@ api.get('/metrics', async (req, res) => {
  *  `?return=<url>` is the post-callback redirect target. Must startsWith
  *  one of CUMORA_AUTH_RETURN_ALLOWLIST entries; otherwise rejected so we
  *  can't be turned into an open redirect. Omit to use AUTH_DONE_URL. */
+/** Which browser sign-in providers this deployment actually has credentials
+ *  for. The sign-in screens use it to avoid offering a button that can only
+ *  503 — GitLab is opt-in (and points at whichever instance the operator
+ *  configured), so most deployments will not have it. */
+api.get('/auth/providers', safe(async (_req, res) => {
+  res.json({ providers: [...WEB_OAUTH_PROVIDERS].filter((p) => providerEnabled(p as Provider)) })
+}))
+
 api.get('/auth/start/:provider', safe(async (req, res) => {
   const provider = req.params.provider as Provider
-  if (provider !== 'google' && provider !== 'github') {
+  if (!isWebOAuthProvider(provider)) {
     res.status(404).json({ error: 'unknown provider' }); return
   }
   if (!providerEnabled(provider)) {
@@ -682,7 +690,7 @@ api.get('/auth/start/:provider', safe(async (req, res) => {
  *  On failure we 302 to the same target with `#error=...`. */
 api.get('/auth/callback/:provider', safe(async (req, res) => {
   const provider = req.params.provider as Provider
-  if (provider !== 'google' && provider !== 'github') {
+  if (!isWebOAuthProvider(provider)) {
     res.status(404).json({ error: 'unknown provider' }); return
   }
   const code = typeof req.query.code === 'string' ? req.query.code : ''

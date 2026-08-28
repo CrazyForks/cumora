@@ -808,7 +808,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_kind    ON audit_events(kind, create
 -- provider gave us at link time — used for cross-provider lookup AND so we
 -- can audit changes if a provider later returns a different email.
 CREATE TABLE IF NOT EXISTS user_identities (
-  provider     TEXT NOT NULL,           -- 'google' | 'github'
+  provider     TEXT NOT NULL,           -- 'google' | 'github' | 'gitlab' | 'apple'
   provider_id  TEXT NOT NULL,           -- sub (Google) / numeric id (GitHub)
   user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   email_lower  TEXT NOT NULL,

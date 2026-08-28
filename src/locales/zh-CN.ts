@@ -68,6 +68,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'auth.continueWithApple': '使用 Apple 继续',
   'auth.continueWithGoogle': '使用 Google 继续',
   'auth.continueWithGithub': '使用 GitHub 继续',
+  'auth.continueWithGitlab': '使用 GitLab 继续',
   'auth.signInToAccept': '登录以接受这份邀请',
   // ─── 网页落地页（app.cumora.ai）───────────────────────────────────
   'web.desktopApp': 'Cumora 是一个桌面应用',

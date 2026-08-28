@@ -271,6 +271,14 @@ export const env = {
   GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET ?? '',
   GITHUB_CLIENT_ID:     process.env.GITHUB_CLIENT_ID     ?? '',
   GITHUB_CLIENT_SECRET: process.env.GITHUB_CLIENT_SECRET ?? '',
+  GITLAB_CLIENT_ID:     process.env.GITLAB_CLIENT_ID     ?? '',
+  GITLAB_CLIENT_SECRET: process.env.GITLAB_CLIENT_SECRET ?? '',
+  /** Which GitLab to talk to. Defaults to gitlab.com; point it at a
+   *  self-managed instance (https://gitlab.example.com) to sign in against
+   *  that one instead. Whatever you set here is TRUSTED to attest its users'
+   *  email ownership — the same trust Google and GitHub get — because a
+   *  verified email is what lets sign-in link to an existing account. */
+  GITLAB_BASE_URL: (process.env.GITLAB_BASE_URL ?? 'https://gitlab.com').replace(/\/+$/, ''),
   /** Public origin this server is reachable at. Used to construct the
    *  per-provider redirect_uri that we hand to Google / GitHub at flow
    *  start. Defaults to http://localhost:5181 for local dev. In prod
