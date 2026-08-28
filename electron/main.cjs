@@ -9,6 +9,7 @@ const https = require('node:https')
 const crypto = require('node:crypto')
 const { pathToFileURL } = require('node:url')
 const autoUpdater = require('./autoUpdater.cjs')
+const { findWindowsCommand } = require('./cli-path.cjs')
 
 const isDev = !app.isPackaged
 const DEV_URL = process.env.ELECTRON_RENDERER_URL || 'http://localhost:5180'
@@ -1602,9 +1603,13 @@ async function detectCliLatest(spec, resolved, envPath) {
 }
 
 async function resolveCliPath(bin, envPath) {
-  const whichCmd = process.platform === 'win32' ? 'where' : 'which'
-  const fromWhich = (await spawnText(whichCmd, [bin], envPath)).split(/\r?\n/)[0]?.trim()
-  if (fromWhich) return fromWhich
+  if (process.platform === 'win32') {
+    const fromPath = await findWindowsCommand(bin, envPath ?? process.env.PATH ?? '')
+    if (fromPath) return fromPath
+  } else {
+    const fromWhich = (await spawnText('which', [bin], envPath)).split(/\r?\n/)[0]?.trim()
+    if (fromWhich) return fromWhich
+  }
   const home = os.homedir()
   const names = process.platform === 'win32' ? [bin, `${bin}.cmd`, `${bin}.exe`] : [bin]
   const dirs = [
