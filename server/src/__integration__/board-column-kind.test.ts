@@ -56,7 +56,10 @@ const columnOf = async (cardId: string): Promise<string> =>
 
 test('a board created through the CLI has its columns classified', async () => {
   const { companyId, agentId } = await seedCompanyWithAgent()
-  const r = await runCli(['--as', agentId, 'board', 'create', 'Launch'])
+  // The subcommand is `kanban`, not `board` — cli.ts dispatches 'kanban' to
+  // cmdBoard. Asserting on r.ok alone would have hidden the typo behind a
+  // generic failure, so the message is checked too.
+  const r = await runCli(['--as', agentId, 'kanban', 'create', 'Launch'])
   assert.equal(r.ok, true, r.text)
 
   const { rows } = await pool.query<{ title: string; kind: string | null }>(
