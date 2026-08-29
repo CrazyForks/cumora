@@ -9,7 +9,7 @@ import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { startConvene, getActiveConvene } from '../agents/convene.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
-import { getTriageEconomics } from '../agents/observability.js'
+import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
 import { notifyMessage, computeMessageRecipients } from '../push.js'
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto'
@@ -4766,6 +4766,18 @@ api.get('/agents/observability/triage', async (req, res) => {
   const rawHours = Number(req.query.sinceHours ?? 24)
   const sinceHours = Math.max(1, Math.min(720, Number.isFinite(rawHours) ? rawHours : 24))
   res.json(await getTriageEconomics({ companyId: tenant, agentId, sinceHours }))
+})
+
+// How often does a wake produce nothing? A group message wakes every member and
+// most conclude it was not theirs — after the big brain has already been paid.
+// Split group vs direct, because a DM legitimately answers far more often and
+// averaging the two hides the number that matters.
+api.get('/agents/observability/wakes', async (req, res) => {
+  const { companyId: tenant } = await requireDevtools(req)
+  const agentId = typeof req.query.agentId === 'string' && req.query.agentId.trim() ? req.query.agentId.trim() : null
+  const rawHours = Number(req.query.sinceHours ?? 24)
+  const sinceHours = Math.max(1, Math.min(720, Number.isFinite(rawHours) ? rawHours : 24))
+  res.json(await getWakeEconomics({ companyId: tenant, agentId, sinceHours }))
 })
 
 // Universal LLM-spend ledger rollup by purpose × model × source. Answers the
