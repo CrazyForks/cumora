@@ -28,6 +28,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
+import { probeEngineVersion } from './cli-version.js'
 
 const IS_WIN = process.platform === 'win32'
 
@@ -3835,6 +3836,12 @@ export interface DetectedEngineSnapshot {
   id: EngineId
   bin: string
   path: string | null
+  /** Version fields are absent from the cheap pairing snapshot and filled in by
+   *  enrichDetectedEngines() on the rescan, which is allowed to spawn CLIs. */
+  version?: string | null
+  latest?: string | null
+  outdated?: boolean
+  updateCommand?: string | null
 }
 
 /** Snapshot the installed engines, optionally in a caller-supplied order
@@ -3848,6 +3855,19 @@ export async function snapshotDetectedEngines(ids?: EngineId[]): Promise<Detecte
       : await resolveBinPath(bin)
     return { id, bin, path }
   }))
+}
+
+/** Add each engine's installed version, the newest one upstream, and how to
+ *  update — measured on *this* machine. Spawns one `--version` per engine, so
+ *  it rides the 5-minute rescan rather than the pairing path, which the user is
+ *  sitting and waiting on. */
+export async function enrichDetectedEngines(
+  snapshot: DetectedEngineSnapshot[],
+): Promise<DetectedEngineSnapshot[]> {
+  return Promise.all(snapshot.map(async (entry) => ({
+    ...entry,
+    ...await probeEngineVersion(entry.id, entry.path),
+  })))
 }
 
 /** Resolve a bin's absolute path on PATH (the first hit), or null if absent. */

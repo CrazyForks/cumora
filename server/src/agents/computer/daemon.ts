@@ -33,7 +33,7 @@ import {
   wakeHasActionableInput,
   type WakeBackgroundBrief,
 } from '../runtime/wake-options.js'
-import { detectEnginesWithStatus, snapshotDetectedEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
+import { detectEnginesWithStatus, snapshotDetectedEngines, enrichDetectedEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
@@ -2584,6 +2584,9 @@ async function doRun(serverOverride?: string): Promise<void> {
     }
   }
 
+  // Last snapshot we successfully described to the server, as a JSON fingerprint.
+  let lastEngineSnapshot = ''
+
   // Engines this machine can currently run, re-scanned on a slow timer. Reported
   // on every heartbeat so installing another supported CLI takes effect without
   // re-pairing — the daemon is already online and can see PATH itself, so there
@@ -2597,10 +2600,20 @@ async function doRun(serverOverride?: string): Promise<void> {
       const changed = replaceEngineInventory(engineInventory, next)
       if (changed) {
         console.log(`[computer] engines on PATH changed: ${previous.join(', ') || 'none'} → ${next.join(', ') || 'none'}`)
-        // Heartbeat already advertises the live inventory. This snapshot is
-        // only the PATH display the app reads — pairable engines, never the
-        // detect-only bins Electron lists on the Me page.
-        const snapshot = await snapshotDetectedEngines(next)
+      }
+      // Heartbeat already advertises the live inventory. This snapshot is
+      // only the PATH display the app reads — pairable engines, never the
+      // detect-only bins Electron lists on the Me page. It carries each
+      // engine's version *as installed on this machine*: the app renders it
+      // verbatim and never probes its own PATH, because whoever is looking at
+      // the card is usually not sitting at the machine it describes.
+      const snapshot = await enrichDetectedEngines(await snapshotDetectedEngines(next))
+      // Report on version drift too, not just install/uninstall — upgrading an
+      // engine in place leaves the engine *list* identical, and that is exactly
+      // when the card's version line goes stale.
+      const fingerprint = JSON.stringify(snapshot)
+      if (fingerprint !== lastEngineSnapshot) {
+        lastEngineSnapshot = fingerprint
         await api(cfg.serverUrl, '/api/computers/me/engines', {
           method: 'POST',
           headers: { Authorization: `Bearer ${cfg.deviceToken}` },
@@ -2640,6 +2653,10 @@ async function doRun(serverOverride?: string): Promise<void> {
   const beat = setInterval(() => { void heartbeat() }, HEARTBEAT_MS)
   const rescan = setInterval(() => { void rescanEngines() }, ENGINE_RESCAN_MS)
   rescan.unref?.()
+  // Pairing reports a cheap paths-only snapshot so the user is not kept waiting
+  // on CLI spawns. Fill in the versions right after startup instead of leaving
+  // the card blank until the first 5-minute tick.
+  void rescanEngines()
   // Keep the service log from filling the disk: rotate at boot, then periodically.
   void rotateLogsIfNeeded()
   const logrot = setInterval(() => { void rotateLogsIfNeeded() }, LOG_ROTATE_MS)

@@ -16,7 +16,21 @@ export interface Computer {
   status: ComputerStatus
   availableEngines: EngineId[]
   /** Last PATH snapshot from the daemon (bin + resolved path). */
-  detectedEngines?: Array<{ id: EngineId; bin: string; path: string | null }>
+  /** Engines installed on THIS computer, as reported by the daemon running on
+   *  it. Never a scan of whichever machine is displaying the card — see
+   *  server/src/agents/computer/cli-version.ts. */
+  detectedEngines?: Array<{
+    id: EngineId
+    bin: string
+    path: string | null
+    /** Installed version on that computer, and the newest one upstream. Null
+     *  when the probe found nothing or the daemon predates version reporting. */
+    version?: string | null
+    latest?: string | null
+    outdated?: boolean
+    /** How to update this engine on that computer (vendor updater, brew, or npm). */
+    updateCommand?: string | null
+  }>
   enginesDetectedAt?: string | null
   lastSeenAt?: string | null
   pairedAt?: string | null

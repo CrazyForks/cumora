@@ -792,44 +792,21 @@ const COMPUTER_STATUS_KEY: Record<string, MessageKey> = {
   offline: 'me.computerStatus.offline',
 }
 
+/** The engines installed on `computer`, as that computer's own daemon reported
+ *  them — paths and versions included.
+ *
+ *  This deliberately does NOT consult the machine the app happens to be running
+ *  on. The card describes a remote host; the only process that can see that
+ *  host's PATH is the daemon on it. An earlier version overlaid a local PATH
+ *  scan whenever it guessed the card was "this machine", which painted the
+ *  desktop's own engine versions onto whichever computer it guessed wrong about. */
 function pairedRows(computer: Computer): AgentRow[] {
-  if (computer.detectedEngines && computer.detectedEngines.length > 0) return computer.detectedEngines
-  return (computer.availableEngines ?? []).map((id) => ({
-    id, bin: ENGINE_BIN[id] ?? id, path: null as string | null,
-  }))
-}
-
-function namesMatch(computerName: string, hostNames: string[]): boolean {
-  const n = computerName.trim().toLowerCase().replace(/\.local$/, '')
-  if (!n) return false
-  return hostNames.some((h) => h.trim().toLowerCase().replace(/\.local$/, '') === n)
-}
-
-function isThisMachine(computer: Computer, hostNames: string[], localComputerCount: number): boolean {
-  if (computer.kind !== 'local') return false
-  if (namesMatch(computer.name, hostNames)) return true
-  return localComputerCount === 1 && hostNames.length > 0
-}
-
-function mergeAgentRows(
-  computer: Computer,
-  localClis: Array<{
-    id: string
-    bin: string
-    path: string
-    version?: string | null
-    latest?: string | null
-    outdated?: boolean
-    updateCommand?: string | null
-  }> | null,
-  thisMachine: boolean,
-): AgentRow[] {
-  const byId = new Map<string, AgentRow>()
-  for (const row of pairedRows(computer)) byId.set(row.id, row)
-  if (thisMachine && localClis) {
-    for (const hit of localClis) byId.set(hit.id, hit)
-  }
-  return [...byId.values()].sort((a, b) => {
+  const rows: AgentRow[] = computer.detectedEngines && computer.detectedEngines.length > 0
+    ? computer.detectedEngines
+    : (computer.availableEngines ?? []).map((id) => ({
+      id, bin: ENGINE_BIN[id] ?? id, path: null as string | null,
+    }))
+  return [...rows].sort((a, b) => {
     const ia = CLI_ORDER.indexOf(a.id)
     const ib = CLI_ORDER.indexOf(b.id)
     return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib)
@@ -875,38 +852,8 @@ function ComputersTab() {
   const [repairCopied, setRepairCopied] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [copiedCli, setCopiedCli] = useState<string | null>(null)
-  const [localDetect, setLocalDetect] = useState<{
-    hostNames: string[]
-    clis: Array<{
-      id: string
-      bin: string
-      path: string
-      version?: string | null
-      latest?: string | null
-      outdated?: boolean
-      updateCommand?: string | null
-    }>
-  } | null>(null)
-  const canDetectLocal = typeof window !== 'undefined' && typeof window.cumora?.detect?.localClis === 'function'
-  const [cliScanning, setCliScanning] = useState(canDetectLocal)
-
-  async function scanLocal() {
-    const fn = typeof window !== 'undefined' ? window.cumora?.detect?.localClis : undefined
-    if (!fn) {
-      setCliScanning(false)
-      return
-    }
-    setCliScanning(true)
-    try {
-      setLocalDetect(await fn())
-    } catch { /* keep previous */ } finally {
-      setCliScanning(false)
-    }
-  }
-
   useEffect(() => {
     void useComputers.getState().refresh()
-    void scanLocal()
   }, [])
   useEffect(() => { if (!repairCopied) return; const id = window.setTimeout(() => setRepairCopied(false), 1600); return () => window.clearTimeout(id) }, [repairCopied])
   useEffect(() => { if (!copiedCli) return; const id = window.setTimeout(() => setCopiedCli(null), 1600); return () => window.clearTimeout(id) }, [copiedCli])
@@ -935,7 +882,6 @@ function ComputersTab() {
   const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engineFlag}${asService ? ' --install-service' : ''}` : ''
   const list = Object.values(byId).sort((a, b) =>
     (a.kind === 'cloud' ? 0 : 1) - (b.kind === 'cloud' ? 0 : 1) || a.name.localeCompare(b.name))
-  const localComputerCount = list.filter((c) => c.kind === 'local').length
 
   function agentCount(computerId: string, isCloud: boolean): number {
     return Object.values(participants).filter((p) =>
@@ -969,7 +915,7 @@ function ComputersTab() {
     setErr(null)
     setBusyId(id)
     try {
-      await Promise.all([useComputers.getState().refresh(), scanLocal()])
+      await useComputers.getState().refresh()
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -994,12 +940,8 @@ function ComputersTab() {
             const expanded = repairFor === c.id
             const enginesShown = enginesOpen.has(c.id)
             const repairCmd = repairCode ? `npx cumora@latest agent computer --pair ${repairCode}${serverFlag}` : ''
-            const thisMachine = isThisMachine(c, localDetect?.hostNames ?? [], localComputerCount)
-            const awaitingCli = repairable && c.kind === 'local' && cliScanning
-            const rows = repairable && !awaitingCli
-              ? mergeAgentRows(c, thisMachine ? (localDetect?.clis ?? null) : null, thisMachine)
-              : []
-            const detecting = busyId === c.id || awaitingCli
+            const rows = repairable ? pairedRows(c) : []
+            const detecting = busyId === c.id
             return (
               <div key={c.id} className="bg-cloud rounded-[14px]" style={{ border: '1px solid var(--ink-100)' }}>
                 <div
@@ -1028,11 +970,9 @@ function ComputersTab() {
                         ? (
                           <>
                             <span>
-                              {awaitingCli
-                                ? t('me.agentsDiagnosing')
-                                : rows.length > 0
-                                  ? (rows.length === 1 ? t('me.agentsCliDetectedOne', { n: rows.length }) : t('me.agentsCliDetectedOther', { n: rows.length }))
-                                  : (n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n }))}
+                              {rows.length > 0
+                                ? (rows.length === 1 ? t('me.agentsCliDetectedOne', { n: rows.length }) : t('me.agentsCliDetectedOther', { n: rows.length }))
+                                : (n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n }))}
                             </span>
                             {c.daemonVersion && (
                               <>
@@ -1077,21 +1017,7 @@ function ComputersTab() {
                   )}
                 </div>
                 {repairable && enginesShown && (
-                  awaitingCli ? (
-                    <div className="px-4 pb-4 space-y-2" aria-busy="true">
-                      <div className="text-[12px] text-ink-500">{t('me.agentsDiagnosing')}</div>
-                      {[0, 1, 2].map((i) => (
-                        <div
-                          key={i}
-                          className="rounded-[12px] px-3 py-2.5 bg-paper"
-                          style={{ border: '1px solid var(--ink-200)' }}
-                        >
-                          <div className="h-3.5 w-24 rounded-md bg-ink-200" />
-                          <div className="mt-2 h-2.5 w-[70%] rounded-md bg-ink-200/80" />
-                        </div>
-                      ))}
-                    </div>
-                  ) : rows.length === 0 ? (
+                  rows.length === 0 ? (
                     <div className="px-4 pb-4 text-[12px] text-ink-400">{t('me.agentsNoEngines')}</div>
                   ) : (
                     <div className="px-4 pb-4 space-y-2">
@@ -1127,7 +1053,7 @@ function ComputersTab() {
                                 </div>
                                 {(row.version || row.latest) && (
                                   <div className="mt-1 flex items-center text-[12px] text-ink-500">
-                                    <span>{row.version ? t('me.agentsCliLocal', { version: row.version }) : t('me.agentsCliUnknown')}</span>
+                                    <span>{row.version ? t('me.agentsCliInstalled', { version: row.version }) : t('me.agentsCliUnknown')}</span>
                                     {row.latest && (
                                       <>
                                         <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
@@ -1145,7 +1071,14 @@ function ComputersTab() {
                               </div>
                             </div>
                             {row.updateCommand && (
-                              <div className="mt-2 flex items-center gap-2">
+                              <div className="mt-2">
+                                {/* The card describes another machine, so say where the
+                                    command has to run — copying it here and pasting it
+                                    into a local shell would update the wrong computer. */}
+                                <div className="text-[11px] text-ink-400 mb-1">
+                                  {t('me.agentsRunOnComputer', { name: c.name })}
+                                </div>
+                                <div className="flex items-center gap-2">
                                 <pre className="flex-1 min-w-0 font-mono text-[11px] truncate bg-ink-900 text-cloud rounded-[8px] px-2 py-1.5 select-all">{row.updateCommand}</pre>
                                 <button
                                   type="button"
@@ -1158,6 +1091,7 @@ function ComputersTab() {
                                 >
                                   {copiedCli === copyKey ? t('me.copied') : t('me.agentsCopyUpdate')}
                                 </button>
+                                </div>
                               </div>
                             )}
                           </div>

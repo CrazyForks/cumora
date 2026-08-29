@@ -47,10 +47,13 @@ test('sanitizeDetectedEngines drops unknown ids and fills missing bins', () => {
     [{ id: 'claude', bin: 'claude', path: '/usr/bin/claude' }, { id: 'bogus', bin: 'x', path: null }],
     ['claude', 'codex', 'gemini', 'bogus'],
   )
+  // Version fields come back on every row — null here, since a daemon this old
+  // reports paths only. See agents-computer-engine-version.test.ts.
+  const noVersion = { version: null, latest: null, outdated: false, updateCommand: null }
   assert.deepEqual(out, [
-    { id: 'claude', bin: 'claude', path: '/usr/bin/claude' },
-    { id: 'codex', bin: 'codex', path: null },
-    { id: 'gemini', bin: 'gemini', path: null },
+    { id: 'claude', bin: 'claude', path: '/usr/bin/claude', ...noVersion },
+    { id: 'codex', bin: 'codex', path: null, ...noVersion },
+    { id: 'gemini', bin: 'gemini', path: null, ...noVersion },
   ])
 })
 

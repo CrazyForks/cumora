@@ -93,13 +93,50 @@ export interface DetectedEngine {
   id: string
   bin: string
   path: string | null
+  /** Version of this engine as installed on the reporting computer, the newest
+   *  one upstream, and how to update it there. Absent when reported by a daemon
+   *  older than the version probe, or when the probe could not read a version —
+   *  the app renders the path alone rather than guessing. */
+  version?: string | null
+  latest?: string | null
+  outdated?: boolean
+  updateCommand?: string | null
+}
+
+/** Trim a daemon-reported display string, or drop it. Control characters are
+ *  stripped so a version line can never smuggle newlines into the update
+ *  command the Me page offers the user to copy and run. */
+function displayString(value: unknown, max: number): string | null {
+  if (typeof value !== 'string') return null
+  const clean = value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
+  return clean ? clean.slice(0, max) : null
+}
+
+function sanitizeVersionFields(rec: Record<string, unknown>): Partial<DetectedEngine> {
+  const version = displayString(rec.version, 64)
+  const latest = displayString(rec.latest, 64)
+  const updateCommand = displayString(rec.updateCommand, 200)
+  return {
+    version,
+    latest,
+    // Never take the daemon's word for it over data we can check ourselves: a
+    // stale `outdated: true` with both versions equal would nag forever.
+    outdated: rec.outdated === true && !!version && !!latest && version !== latest,
+    updateCommand,
+  }
+}
+
+/** An engine we know is advertised but have no PATH/version report for. */
+function unreportedEngine(id: string): DetectedEngine {
+  return {
+    id, bin: ENGINE_BINS[id] ?? id, path: null,
+    version: null, latest: null, outdated: false, updateCommand: null,
+  }
 }
 
 export function sanitizeDetectedEngines(raw: unknown, engineIds: string[]): DetectedEngine[] {
   const allowed = engineIds.filter((id) => PAIRABLE_ENGINES.has(id))
-  if (!Array.isArray(raw)) {
-    return allowed.map((id) => ({ id, bin: ENGINE_BINS[id] ?? id, path: null }))
-  }
+  if (!Array.isArray(raw)) return allowed.map(unreportedEngine)
   const byId = new Map<string, DetectedEngine>()
   for (const item of raw) {
     if (!item || typeof item !== 'object') continue
@@ -108,9 +145,11 @@ export function sanitizeDetectedEngines(raw: unknown, engineIds: string[]): Dete
     if (!PAIRABLE_ENGINES.has(id) || !allowed.includes(id)) continue
     const bin = typeof rec.bin === 'string' && rec.bin.trim() ? rec.bin.trim() : (ENGINE_BINS[id] ?? id)
     const path = typeof rec.path === 'string' && rec.path.trim() ? rec.path.trim() : null
-    byId.set(id, { id, bin, path })
+    byId.set(id, { id, bin, path, ...sanitizeVersionFields(rec) })
   }
-  return allowed.map((id) => byId.get(id) ?? { id, bin: ENGINE_BINS[id] ?? id, path: null })
+  // Every row carries the same keys, reported or not, so the app never has to
+  // distinguish "field absent" from "nothing installed to report".
+  return allowed.map((id) => byId.get(id) ?? unreportedEngine(id))
 }
 
 export interface ComputerRow {
