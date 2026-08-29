@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useParticipants } from '@/stores/participants'
 import { useComputers } from '@/stores/computers'
 import { usePrefs } from '@/stores/preferences'
@@ -857,6 +857,19 @@ function ComputersTab() {
   // Default on: install the always-on service (auto-start/restart/update).
   const [asService, setAsService] = useState(true)
   // Per-computer re-pair (reconnect) command, keyed by computer id.
+  // Which computers have their engine list open. Collapsed by default: a
+  // paired machine can carry seven CLIs, each with a path, two versions and an
+  // update command, which buried the machines themselves under a wall of
+  // detail. The header keeps the summary ("5 engines detected"), so the count
+  // is legible without opening anything.
+  const [enginesOpen, setEnginesOpen] = useState<ReadonlySet<string>>(new Set())
+  const toggleEngines = useCallback((id: string) => {
+    setEnginesOpen((prev) => {
+      const next = new Set(prev)
+      if (!next.delete(id)) next.add(id)
+      return next
+    })
+  }, [])
   const [repairFor, setRepairFor] = useState<string | null>(null)
   const [repairCode, setRepairCode] = useState<string | null>(null)
   const [repairCopied, setRepairCopied] = useState(false)
@@ -979,6 +992,7 @@ function ComputersTab() {
             const n = agentCount(c.id, c.kind === 'cloud')
             const repairable = c.kind !== 'cloud'
             const expanded = repairFor === c.id
+            const enginesShown = enginesOpen.has(c.id)
             const repairCmd = repairCode ? `npx cumora@latest agent computer --pair ${repairCode}${serverFlag}` : ''
             const thisMachine = isThisMachine(c, localDetect?.hostNames ?? [], localComputerCount)
             const awaitingCli = repairable && c.kind === 'local' && cliScanning
@@ -990,7 +1004,9 @@ function ComputersTab() {
               <div key={c.id} className="bg-cloud rounded-[14px]" style={{ border: '1px solid var(--ink-100)' }}>
                 <div
                   className={cn('p-4 flex items-center gap-4 rounded-[14px]', repairable && 'cursor-pointer hover:bg-sky2-50')}
-                  onClick={repairable ? () => void toggleRepair(c.id) : undefined}>
+                  onClick={repairable ? () => toggleEngines(c.id) : undefined}
+                  role={repairable ? 'button' : undefined}
+                  aria-expanded={repairable ? enginesShown : undefined}>
                   <div className="text-[22px] w-8 text-center">{KIND_ICON[c.kind] ?? '🖥'}</div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
@@ -1040,15 +1056,27 @@ function ComputersTab() {
                         className="text-[12px] font-semibold text-skype-deep disabled:opacity-45 px-2 py-1">
                         {detecting ? t('me.agentsRefreshing') : t('me.agentsRefresh')}
                       </button>
-                      <span className="text-[12px] font-semibold text-skype-deep">{expanded ? t('me.hideAction') : t('me.reconnect')}</span>
+                      {/* Was a bare span riding the header's onClick. The header
+                          now opens the engine list, so reconnect needs its own
+                          handler — and must not also toggle the list. */}
+                      <button type="button" onClick={(e) => { e.stopPropagation(); void toggleRepair(c.id) }}
+                        className="text-[12px] font-semibold text-skype-deep px-2 py-1">
+                        {expanded ? t('me.hideAction') : t('me.reconnect')}
+                      </button>
                       <button onClick={(e) => { e.stopPropagation(); void remove(c.id, c.name) }}
                         className="text-[12px] font-semibold text-coral-deep hover:underline px-2 py-1">
                         {t('me.remove')}
                       </button>
+                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                        strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+                        className="text-ink-300 shrink-0 transition-transform"
+                        style={{ transform: enginesShown ? 'rotate(180deg)' : 'none' }}>
+                        <path d="M6 9l6 6 6-6" />
+                      </svg>
                     </>
                   )}
                 </div>
-                {repairable && (
+                {repairable && enginesShown && (
                   awaitingCli ? (
                     <div className="px-4 pb-4 space-y-2" aria-busy="true">
                       <div className="text-[12px] text-ink-500">{t('me.agentsDiagnosing')}</div>
