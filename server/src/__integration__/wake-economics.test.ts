@@ -32,21 +32,27 @@ async function seedConvo(companyId: string, kind: 'group' | 'direct', members: s
   return id
 }
 
-/** A completed run that spent tokens, triggered by `convoId`. */
+/** A completed run triggered by `convoId`.
+ *
+ *  `tokens: 0` must mean a genuinely token-free run — EVERY token column zero,
+ *  not just the input one. The query's `(input + cached + output) > 0` filter is
+ *  what keeps an orphaned run out of the metric, so a fixture that leaves output
+ *  tokens behind silently tests the wrong thing. */
 async function seedRun(args: {
   companyId: string; agentId: string; convoId: string; minutesAgo?: number; tokens?: number
 }): Promise<string> {
   const id = `run-${randomUUID().slice(0, 8)}`
-  const tokens = args.tokens ?? 1000
+  const inputTokens = args.tokens ?? 1000
+  const outputTokens = inputTokens > 0 ? 100 : 0
   await pool.query(
     `INSERT INTO agent_runs
        (id, agent_id, company_id, trigger, status, model,
         input_tokens, cached_input_tokens, cache_creation_tokens, output_tokens, started_at)
      VALUES ($1, $2, $3, $4::jsonb, 'completed', 'gpt-5.5',
-             $5, 0, 0, 100, NOW() - ($6::double precision * INTERVAL '1 minute'))`,
+             $5, 0, 0, $6, NOW() - ($7::double precision * INTERVAL '1 minute'))`,
     [id, args.agentId, args.companyId,
      JSON.stringify({ source: 'message.new', conversationIds: [args.convoId] }),
-     tokens, args.minutesAgo ?? 5],
+     inputTokens, outputTokens, args.minutesAgo ?? 5],
   )
   return id
 }
