@@ -538,3 +538,154 @@ export async function getTriageEconomics(args: {
     recent,
   }
 }
+
+/** How long after a wake we still count a post as "this run answered".
+ *  Ten minutes is the window @yetone used to publish the 26.3% figure in #70;
+ *  keeping it identical is what makes this surface comparable to that number
+ *  rather than a second, differently-shaped statistic. */
+const SILENT_WINDOW_MS = 10 * 60_000
+
+export interface SilentWakeBucket {
+  /** 'group' | 'direct' — a DM legitimately answers far more often, so the two
+   *  must never be averaged into one rate. */
+  conversationKind: string
+  runs: number
+  silentRuns: number
+  silentRate: number
+  /** Big-brain spend on the silent runs, priced at query time from the stored
+   *  token counts (same rule as the triage ledger: tokens are real, prices are
+   *  live). */
+  silentSpendUsd: number
+}
+
+export interface WakeEconomics {
+  sinceHours: number
+  buckets: SilentWakeBucket[]
+  /** Any price used was a seed/fallback rather than an operator-supplied rate.
+   *  The RATIOS are measured either way; only the dollars are modelled. */
+  costEstimated: boolean
+}
+
+/** How often a wake produced nothing.
+ *
+ *  A run counts as SILENT when the agent posted no message into any of the
+ *  conversations that woke it, within SILENT_WINDOW_MS of the run starting.
+ *  That is the whole point of #70: a group message wakes every member, each
+ *  reasons over the same room, and most of them conclude it was not theirs —
+ *  after the big brain has already been paid.
+ *
+ *  This exists so that decision stops needing a hand-written query. The routing
+ *  change in #92 is meant to move this number; without a surface, "did it work"
+ *  is an argument rather than a measurement.
+ *
+ *  Deliberately NOT a counterfactual: it reports what happened, not what would
+ *  have been saved. The one modelled quantity is the dollar column, and
+ *  `costEstimated` says so. */
+export async function getWakeEconomics(args: {
+  companyId: string
+  agentId?: string | null
+  sinceHours?: number
+}): Promise<WakeEconomics> {
+  const sinceHours = Math.min(720, Math.max(1, args.sinceHours ?? 24))
+  const ms = sinceHours * 3_600_000
+  const agentFilter = args.agentId ? 'AND r.agent_id = $4' : ''
+  const params: unknown[] = [args.companyId, ms, SILENT_WINDOW_MS]
+  if (args.agentId) params.push(args.agentId)
+
+  // One aggregate, grouped in SQL — never a row per run in JS. Runs are reached
+  // through idx_agent_runs_company_started; the silence probe is an anti-join
+  // per (conversation, agent, window), which idx_messages_convo_created serves.
+  // Only runs that actually spent tokens are counted: an orphaned 0-token row
+  // never reached the model, so calling it a "silent wake" would inflate the
+  // very number this exists to track.
+  const { rows } = await pool.query<{
+    conversation_kind: string
+    runs: number
+    silent_runs: number
+    model: string | null
+    input_tokens: string
+    cached_tokens: string
+    cache_creation_tokens: string
+    output_tokens: string
+  }>(
+    `WITH run_convo AS (
+       SELECT r.id, r.agent_id, r.started_at, r.model,
+              r.input_tokens, r.cached_input_tokens, r.cache_creation_tokens, r.output_tokens,
+              (SELECT cid FROM jsonb_array_elements_text(r.trigger->'conversationIds') AS cid LIMIT 1) AS conversation_id
+         FROM agent_runs r
+        WHERE r.company_id = $1
+          AND r.started_at > NOW() - ($2::double precision * INTERVAL '1 millisecond')
+          AND (r.input_tokens + r.cached_input_tokens + r.output_tokens) > 0
+          ${agentFilter}
+     )
+     SELECT COALESCE(c.kind, 'group') AS conversation_kind,
+            rc.model,
+            count(*)::int AS runs,
+            count(*) FILTER (
+              WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id
+                   AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+              )
+            )::int AS silent_runs,
+            COALESCE(sum(rc.input_tokens) FILTER (WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+            )), 0)::bigint AS input_tokens,
+            COALESCE(sum(rc.cached_input_tokens) FILTER (WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+            )), 0)::bigint AS cached_tokens,
+            COALESCE(sum(rc.cache_creation_tokens) FILTER (WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+            )), 0)::bigint AS cache_creation_tokens,
+            COALESCE(sum(rc.output_tokens) FILTER (WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+            )), 0)::bigint AS output_tokens
+       FROM run_convo rc
+       LEFT JOIN conversations c ON c.id = rc.conversation_id
+      GROUP BY conversation_kind, rc.model`,
+    params,
+  )
+
+  const byKind = new Map<string, { runs: number; silent: number; usd: number }>()
+  let anyEstimated = false
+  for (const r of rows) {
+    const { usd, estimated } = effectiveCostUsd(r.model, {
+      inputTokens: Number(r.input_tokens),
+      cachedInputTokens: Number(r.cached_tokens),
+      cacheCreationTokens: Number(r.cache_creation_tokens),
+      outputTokens: Number(r.output_tokens),
+    })
+    if (estimated) anyEstimated = true
+    const cur = byKind.get(r.conversation_kind) ?? { runs: 0, silent: 0, usd: 0 }
+    cur.runs += r.runs
+    cur.silent += r.silent_runs
+    cur.usd += usd
+    byKind.set(r.conversation_kind, cur)
+  }
+
+  return {
+    sinceHours,
+    costEstimated: anyEstimated,
+    buckets: [...byKind].map(([conversationKind, v]) => ({
+      conversationKind,
+      runs: v.runs,
+      silentRuns: v.silent,
+      silentRate: v.runs > 0 ? v.silent / v.runs : 0,
+      silentSpendUsd: v.usd,
+    })).sort((a, b) => b.runs - a.runs),
+  }
+}
