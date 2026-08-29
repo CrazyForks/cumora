@@ -55,6 +55,7 @@ async function agentCompany(agentId: string): Promise<string | null> {
 /* ============== argv parsing ============== */
 
 import { parseArgs, unescapeChat, joinBodyArgs, tokenize, type ParsedArgs } from './cli-parse.js'
+import { claimTargetColumn, type ColumnKind } from './board-columns.js'
 export { tokenize }
 
 // resolveAs lives in ./cli-identity for test-isolation (zero-side-effect
@@ -4696,8 +4697,8 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     }>(`SELECT id, title, description, company_id FROM boards WHERE id = $1 LIMIT 1`, [boardId])
     if (b.rows.length === 0 || b.rows[0].company_id !== companyId) return err(`board ${boardId} not found`)
     const cols = await pool.query<{
-      id: string; title: string; position: number
-    }>(`SELECT id, title, position FROM board_columns WHERE board_id = $1 ORDER BY position ASC`, [boardId])
+      id: string; title: string; position: number; kind: string | null
+    }>(`SELECT id, title, position, kind FROM board_columns WHERE board_id = $1 ORDER BY position ASC`, [boardId])
     const cards = await pool.query<{
       id: string; column_id: string; title: string; assignee_id: string | null
       mentions: string[]; position: number
@@ -4720,7 +4721,10 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     if (b.rows[0].description) lines.push(b.rows[0].description)
     for (const col of cols.rows) {
       const list = cardsByCol.get(col.id) ?? []
-      lines.push('', `## ${col.title}  (${col.id})  · ${list.length} card(s)`)
+      // Name the column's MEANING, not just its title: an agent moving a card
+      // should not have to infer which column counts as done from prose.
+      const meaning = col.kind ? `  [${col.kind}]` : ''
+      lines.push('', `## ${col.title}${meaning}  (${col.id})  · ${list.length} card(s)`)
       for (const c of list) {
         const who = c.assignee_id ? `@${c.assignee_id}` : '(unassigned)'
         const mentions = Array.isArray(c.mentions) && c.mentions.length > 0
@@ -4746,11 +4750,13 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
         `INSERT INTO boards (id, company_id, title, description, created_by) VALUES ($1, $2, $3, $4, $5)`,
         [id, companyId, title.slice(0, 200), description, me],
       )
-      const seeds = ['Todo', 'Doing', 'Done']
+      // Seed the MEANING alongside the title, so an agent asked to advance a
+      // card never has to infer "which column is Doing" from prose.
+      const seeds: Array<[string, ColumnKind]> = [['Todo', 'todo'], ['Doing', 'doing'], ['Done', 'done']]
       for (let i = 0; i < seeds.length; i++) {
         await client.query(
-          `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
-          [`col-${randomUUID().slice(0, 12)}`, id, seeds[i], (i + 1) * 1000],
+          `INSERT INTO board_columns (id, board_id, title, position, kind) VALUES ($1, $2, $3, $4, $5)`,
+          [`col-${randomUUID().slice(0, 12)}`, id, seeds[i][0], (i + 1) * 1000, seeds[i][1]],
         )
       }
       await client.query('COMMIT')
@@ -5308,8 +5314,23 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
       const holder = cur.rows[0]?.assignee_id
       return err(`claim failed: card ${cardId} is already being worked by @${holder ?? '?'} — move on to another task`)
     }
-    await publishBoardCli({ companyId, kind: 'card.updated', boardId: home.boardId, cardId, actorId: me })
-    return ok(`claimed card ${cardId} — it's yours. Do the work, post progress with \`card comment\`, move it with \`card move\`, and release with \`card assign ${cardId} null\` (or move to a done column) when finished.`, [{
+    // Claiming IS the moment work starts, so reflect it on the board instead of
+    // relying on the agent to remember a second command — that gap is why a
+    // board could read Todo 2 / Doing 1 / Done 0 while the work was finished and
+    // delivered in chat (#69). Only ever forward, and only on a board whose
+    // columns declare what they mean; see claimTargetColumn.
+    const cols = await pool.query<{ id: string; position: number; kind: string | null }>(
+      `SELECT id, position, kind FROM board_columns WHERE board_id = $1`, [home.boardId],
+    )
+    const advanceTo = claimTargetColumn({ columns: cols.rows, currentColumnId: home.columnId })
+    if (advanceTo) {
+      await pool.query(
+        `UPDATE board_cards SET column_id = $1, updated_at = NOW() WHERE id = $2`,
+        [advanceTo, cardId],
+      )
+    }
+    await publishBoardCli({ companyId, kind: advanceTo ? 'card.moved' : 'card.updated', boardId: home.boardId, cardId, actorId: me })
+    return ok(`claimed card ${cardId} — it's yours${advanceTo ? ' and moved to Doing' : ''}. Do the work, post progress with \`card comment\`, move it with \`card move\`, and release with \`card assign ${cardId} null\` (or move to a done column) when finished.`, [{
       event: 'kanban.card_claimed',
       command: 'card claim',
       boardId: home.boardId,

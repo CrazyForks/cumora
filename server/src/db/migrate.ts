@@ -1302,6 +1302,29 @@ CREATE TABLE IF NOT EXISTS board_columns (
 );
 CREATE INDEX IF NOT EXISTS idx_board_columns_board ON board_columns(board_id, position ASC);
 
+-- What a column MEANS, as opposed to what it is called. 'todo' | 'doing' |
+-- 'done', or NULL for a column whose meaning we do not know.
+--
+-- Both board-creation paths already seed the conventional "Todo / Doing / Done",
+-- so the convention existed — it just was not machine-readable, and an agent
+-- asked to "move it to Doing" had to guess which column that was from its title.
+-- That is why card claim could set an assignee but never advance the card, and
+-- why a board could read Todo 2 / Doing 1 / Done 0 while the work was finished
+-- and delivered in chat.
+ALTER TABLE board_columns ADD COLUMN IF NOT EXISTS kind TEXT;
+
+-- Backfill EXACT matches on the seeded defaults only, case-insensitively.
+-- Deliberately not a fuzzy match: a board whose columns are "Backlog / In
+-- flight / Shipped" is better left NULL (nothing moves automatically) than
+-- guessed at, and a wrong guess would silently move a user's cards. Runs once;
+-- already-classified columns are left alone so a later manual choice sticks.
+UPDATE board_columns SET kind = 'todo'
+ WHERE kind IS NULL AND lower(btrim(title)) IN ('todo', 'to do');
+UPDATE board_columns SET kind = 'doing'
+ WHERE kind IS NULL AND lower(btrim(title)) = 'doing';
+UPDATE board_columns SET kind = 'done'
+ WHERE kind IS NULL AND lower(btrim(title)) = 'done';
+
 -- Cards live in a column. The "mentions" column is the deduped list of
 -- @-targets parsed from title+description on every write — clients can
 -- fan out notifications / "assigned to me" filters off it without

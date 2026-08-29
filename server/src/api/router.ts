@@ -5133,11 +5133,14 @@ api.post('/boards', async (req, res) => {
       `INSERT INTO boards (id, company_id, title, description, created_by) VALUES ($1, $2, $3, $4, $5)`,
       [id, companyId, title, description, me],
     )
-    const seeds = ['Todo', 'Doing', 'Done']
+    // Seed the MEANING alongside the title — see board-columns.ts. Without it an
+    // agent asked to advance a card has to infer which column is "Doing" from
+    // its name, which is why claim could never move anything.
+    const seeds: Array<[string, string]> = [['Todo', 'todo'], ['Doing', 'doing'], ['Done', 'done']]
     for (let i = 0; i < seeds.length; i++) {
       await client.query(
-        `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
-        [`col-${randomUUID().slice(0, 12)}`, id, seeds[i], (i + 1) * 1000],
+        `INSERT INTO board_columns (id, board_id, title, position, kind) VALUES ($1, $2, $3, $4, $5)`,
+        [`col-${randomUUID().slice(0, 12)}`, id, seeds[i][0], (i + 1) * 1000, seeds[i][1]],
       )
     }
     await client.query('COMMIT')
@@ -5167,9 +5170,9 @@ api.get('/boards/:id', async (req, res) => {
   )
   if (board.rows.length === 0) throw new HttpError(404, 'not found')
   const cols = await pool.query<{
-    id: string; title: string; position: number; created_at: string
+    id: string; title: string; position: number; kind: string | null; created_at: string
   }>(
-    `SELECT id, title, position, created_at
+    `SELECT id, title, position, kind, created_at
        FROM board_columns WHERE board_id = $1 ORDER BY position ASC`,
     [boardId],
   )
