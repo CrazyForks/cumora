@@ -223,7 +223,14 @@ export function scanRepo() {
   return problems
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Compare filesystem paths, not a hand-built file:// URL. On Windows
+// process.argv[1] is `E:\...` while import.meta.url is `file:///E:/...`, so
+// the string form never matched and `npm run guard:engine-registry` exited 0
+// without ever calling scanRepo() — the guard silently becoming a no-op is the
+// exact failure this file exists to prevent. Same shape guard-big-brain.mjs
+// already used.
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]
+if (isMain) {
   const problems = scanRepo()
   if (problems.length === 0) {
     console.log('✅ engine registry guard: every engine in ENGINE_IDS is wired into all of its lists.')
