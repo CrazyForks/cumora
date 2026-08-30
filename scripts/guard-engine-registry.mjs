@@ -102,8 +102,13 @@ const CHECKS = [
   },
   {
     file: 'src/lib/engines.ts',
-    what: 'RUNNABLE_ENGINE_IDS',
-    body: (s) => extract(s, /export const RUNNABLE_ENGINE_IDS = new Set\(\[([^\]]*)\]/),
+    what: 'the runnable-engine list',
+    // Two accepted shapes: the ordered `RUNNABLE_ENGINES` tuple the UI pickers
+    // map over, and the older `RUNNABLE_ENGINE_IDS` Set literal it is derived
+    // from. Reading whichever exists keeps this guard from being the thing
+    // that blocks collapsing that duplicate.
+    body: (s) => extract(s, /export const RUNNABLE_ENGINES(?::[^=]*)? = \[([^\]]*)\]/)
+      ?? extract(s, /export const RUNNABLE_ENGINE_IDS(?::[^=]*)? = new Set(?:<string>)?\(\[([^\]]*)\]/),
     needle: (id) => `'${id}'`,
     fix: 'add the id to RUNNABLE_ENGINE_IDS, or the engine stays detect-only in the UI',
   },
