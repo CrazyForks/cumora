@@ -467,11 +467,23 @@ export interface ApiSilentWakeBucket {
   silentSpendUsd: number
 }
 
+export interface ApiTurnsPerMessageBucket {
+  conversationKind: string
+  messages: number
+  turns: number
+  avgTurns: number
+  medianTurns: number
+  hist: { turns: string; messages: number }[]
+}
+
 export interface ApiWakeEconomics {
   sinceHours: number
   buckets: ApiSilentWakeBucket[]
   /** The RATIOS are measured either way; only the dollar column is modelled. */
   costEstimated: boolean
+  /** Fan-out width per human message. Room-wide: not scoped by the agentId
+   *  filter, because width is a property of the room, not of one agent. */
+  turnsPerMessage: ApiTurnsPerMessageBucket[]
 }
 
 export interface ApiTriageEconomics {
