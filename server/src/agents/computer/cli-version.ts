@@ -146,6 +146,25 @@ function versionParts(v: string): number[] {
   return main.split('.').map((n) => Number.parseInt(n, 10) || 0)
 }
 
+/** Semver/CalVer floor used for local capability gates. A prerelease at the
+ * exact numeric floor remains below the final release; unknown versions fail
+ * closed at the caller. */
+export function isCliVersionAtLeast(current: string | null, minimum: string): boolean {
+  if (!current) return false
+  const a = versionParts(current)
+  const b = versionParts(minimum)
+  const n = Math.max(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    if (x > y) return true
+    if (x < y) return false
+  }
+  const currentMain = current.trim().replace(/^v/i, '').split('+', 1)[0]
+  const minimumMain = minimum.trim().replace(/^v/i, '').split('+', 1)[0]
+  return !(currentMain.includes('-') && !minimumMain.includes('-'))
+}
+
 /** True only when `latest` is strictly newer. Unknown on either side means we
  *  say nothing rather than nag. */
 export function isCliOutdated(current: string | null, latest: string | null): boolean {
@@ -304,4 +323,12 @@ export async function probeEngineVersion(id: string, binPath: string | null): Pr
     outdated,
     updateCommand: outdated ? inferUpdateCommand(spec, binPath) : null,
   }
+}
+
+/** Local-only version probe for security capability gates. Unlike
+ * probeEngineVersion(), this never contacts npm or an engine updater. */
+export async function probeLocalEngineVersion(id: string, binPath: string | null): Promise<string | null> {
+  const spec = ENGINE_VERSION_SPECS[id]
+  if (!spec || !binPath) return null
+  return parseCliVersion(await spawnText(binPath, spec.versionArgs, 6000))
 }

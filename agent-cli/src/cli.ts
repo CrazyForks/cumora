@@ -21,7 +21,8 @@ async function main(): Promise<void> {
     'Usage:\n' +
     '  npx cumora@latest agent computer --pair <code> [--server <url>]   pair this machine\n' +
     '  npx cumora@latest agent computer [--server <url>]                 start the daemon\n\n' +
-    'Needs `claude` (Claude Code), `codex`, `grok` (Grok Build), `cursor-agent` (Cursor), `opencode`, `pi`, or `gemini` (Gemini CLI) on PATH. Get a pairing code from\n' +
+    'Secure default: Claude Code on macOS/Linux/WSL2, or Codex on macOS/Linux/WSL2/Windows.\n' +
+    'Other engines require the high-risk CUMORA_BYOA_ALLOW_UNSANDBOXED=1 compatibility switch. Get a pairing code from\n' +
     'Cumora → You → Computers → Add a computer.\n',
   )
   process.exit(argv.length ? 1 : 0)

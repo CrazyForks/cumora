@@ -8,17 +8,18 @@
  *
  * Run: node --import tsx --test server/src/__tests__/agents-computer-engine-version.test.ts
  */
-import { test } from 'node:test'
+
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { test } from 'node:test'
 
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
 const {
-  parseCliVersion, isCliOutdated, inferUpdateCommand,
+  parseCliVersion, isCliOutdated, isCliVersionAtLeast, inferUpdateCommand,
   parseCursorAbout, parseGrokCheck, ENGINE_VERSION_SPECS, versionCommandInvocation,
 } = await import('../agents/computer/cli-version.js')
 const { sanitizeDetectedEngines } = await import('../agents/computer/registry.js')
@@ -61,6 +62,15 @@ test('isCliOutdated only fires when upstream is strictly newer', () => {
   // Unknown on either side must stay silent rather than nag.
   assert.equal(isCliOutdated(null, '1.2.3'), false)
   assert.equal(isCliOutdated('1.2.3', null), false)
+})
+
+test('isCliVersionAtLeast enforces a local security floor', () => {
+  assert.equal(isCliVersionAtLeast('2.1.248', '2.1.248'), true)
+  assert.equal(isCliVersionAtLeast('2.1.251', '2.1.248'), true)
+  assert.equal(isCliVersionAtLeast('2.1.247', '2.1.248'), false)
+  assert.equal(isCliVersionAtLeast('2.1.248-beta.1', '2.1.248'), false)
+  assert.equal(isCliVersionAtLeast('0.138.0', '0.138.0'), true)
+  assert.equal(isCliVersionAtLeast(null, '0.138.0'), false)
 })
 
 test('inferUpdateCommand prefers the vendor updater, then brew, then npm', () => {

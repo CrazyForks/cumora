@@ -11,14 +11,15 @@
  *
  * Run: node --import tsx --test server/src/__tests__/agents-computer-engine-pi.test.ts
  */
-import { mkdtemp, mkdir, writeFile, readFile, chmod, rm } from 'node:fs/promises'
+
+import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, test } from 'node:test'
-import assert from 'node:assert/strict'
-import { getAdapter, type EngineHopReport } from '../agents/computer/engine.js'
+import { setTimeout as delay } from 'node:timers/promises'
+import { type EngineHopReport, getAdapter } from '../agents/computer/engine.js'
 
 const IS_WIN = process.platform === 'win32'
 const tempDirs: string[] = []
@@ -38,7 +39,7 @@ const scenario = process.env.FAKE_PI_SCENARIO || 'ok'
 const mode = argv.includes('rpc') ? 'rpc' : argv.includes('json') ? 'json' : 'text'
 const sidIdx = argv.indexOf('--session-id')
 const SID = sidIdx >= 0 ? argv[sidIdx + 1] : 'fake-session-' + mode
-record({ argv, cwd: process.cwd() })
+record({ argv, cwd: process.cwd(), pid: process.pid })
 if (scenario === 'ignore-eof') {
   setInterval(() => {}, 1000)
   process.on('SIGTERM', () => { record({ signal: 'SIGTERM' }); process.exit(0) })
@@ -126,7 +127,7 @@ async function fixture(scenario = 'ok'): Promise<Fixture> {
   return { root, binDir, home, log, env }
 }
 
-async function fakeLog(f: Fixture): Promise<Array<{ argv?: string[]; cmd?: { type: string; id?: string; message?: string }; signal?: string }>> {
+async function fakeLog(f: Fixture): Promise<Array<{ argv?: string[]; cmd?: { type: string; id?: string; message?: string }; signal?: string; pid?: number }>> {
   if (!existsSync(f.log)) return []
   return (await readFile(f.log, 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l))
 }
@@ -199,7 +200,7 @@ test('pi persistent session: one prompt → one turn, session id, summed usage, 
   assert.equal(hops.length, 1)
   assert.equal(hops[0].hopIndex, 1, 'hop index restarts per turn')
   assert.equal((await fakeLog(f)).filter((s) => s.argv).length, 1, 'still one process')
-  session.stop()
+  await session.stop()
 })
 
 test('pi persistent session: steer() rides pi\'s native steer command mid-turn; busy while a turn is in flight', { skip: IS_WIN }, async () => {
@@ -221,7 +222,7 @@ test('pi persistent session: steer() rides pi\'s native steer command mid-turn; 
   session.steer('too late')
   await delay(50)
   assert.equal((await fakeLog(f)).map((s) => s.cmd).filter(Boolean).length, 3)
-  session.stop()
+  await session.stop()
 })
 
 test('pi persistent session: a model error surfaces as a failed turn, not a hang', { skip: IS_WIN }, async () => {
@@ -232,7 +233,7 @@ test('pi persistent session: a model error surfaces as a failed turn, not a hang
   assert.equal(result.exitCode, 1)
   assert.match(result.error ?? '', /rate limit exceeded \(429\)/)
   assert.equal(session.alive, true, 'the process is still up — only the turn failed')
-  session.stop()
+  await session.stop()
 })
 
 test('pi persistent session: a prompt rejected by pi settles immediately', { skip: IS_WIN }, async () => {
@@ -242,7 +243,7 @@ test('pi persistent session: a prompt rejected by pi settles immediately', { ski
   const result = await session.send('hi')
   assert.equal(result.exitCode, 1)
   assert.match(result.error ?? '', /rejected the turn: Agent is already streaming/)
-  session.stop()
+  await session.stop()
 })
 
 test('pi persistent session: process death mid-turn fails the turn with stderr and is logged', { skip: IS_WIN }, async () => {
@@ -317,7 +318,7 @@ test('pi abort during listener registration never dispatches a prompt or becomes
   assert.ok(!commands.some((command) => command?.type === 'prompt'), 'the cancelled turn must not reach session.send()')
 })
 
-test('pi forced stop signals an EOF-resistant child before the daemon can exit', { skip: IS_WIN }, async () => {
+test('pi forced stop kills an EOF-resistant child before the daemon can exit', { skip: IS_WIN }, async () => {
   const f = await fixture('ignore-eof')
   const session = getAdapter('pi').startSession?.({ home: f.home, env: f.env, model: null, fastModel: null, onLog: () => {} })
   assert.ok(session)
@@ -325,10 +326,20 @@ test('pi forced stop signals an EOF-resistant child before the daemon can exit',
   // Wait until the child has started and accepted get_state, then model the
   // daemon's final shutdown path: there is no two-second timer opportunity.
   for (let i = 0; i < 50 && (await fakeLog(f)).length < 2; i += 1) await delay(20)
-  session.stop({ force: true })
-  for (let i = 0; i < 50 && !(await fakeLog(f)).some((entry) => entry.signal === 'SIGTERM'); i += 1) await delay(20)
+  const pid = (await fakeLog(f))[0]?.pid
+  assert.equal(typeof pid, 'number')
+  await session.stop({ force: true })
 
-  assert.ok((await fakeLog(f)).some((entry) => entry.signal === 'SIGTERM'), 'force stop must dispatch SIGTERM synchronously instead of relying on the delayed fallback')
+  let alive = true
+  for (let i = 0; i < 50 && alive; i += 1) {
+    try { process.kill(pid as number, 0) }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ESRCH') alive = false
+      else throw err
+    }
+    if (alive) await delay(20)
+  }
+  assert.equal(alive, false, 'force stop must synchronously dispatch a fatal tree signal instead of relying on the delayed fallback')
   assert.equal(session.alive, false)
 })
 

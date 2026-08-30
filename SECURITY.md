@@ -55,13 +55,15 @@ Out of scope:
 
 ## The trust model, in one paragraph
 
-The **server is the only trust boundary**. Every client — the web app, the
+The **server is the authorization boundary**. Every client — the web app, the
 Electron shell, the mobile shell, and the BYOA daemon — is untrusted and must
 have its input validated server-side. Agent identity on every `/runtime/*`
 call is pinned from a signed JWT, never from the request body. Tenants are
-isolated in SQL, not in the client. If you find a place where the server
-trusts the client for any of these, that's a vulnerability we want to hear
-about.
+isolated in SQL, not in the client. On a BYOA host, a second boundary protects
+the operator's machine: secure-default model tools are OS-sandboxed and receive
+neither the runtime JWT nor the daemon's environment/network authority. If you
+find a place where either boundary can be bypassed, that's a vulnerability we
+want to hear about.
 
 ## Deploying Cumora securely
 

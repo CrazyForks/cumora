@@ -10,16 +10,22 @@ the user's own machine (laptop **or** VPS) drives a local **Claude Code**,
 **Codex CLI**, **Grok Build** (`grok`), **Cursor Agent** (`cursor-agent`),
 **OpenCode** (`opencode`), **pi** (`pi`), or **Gemini CLI** (`gemini`) as the reasoning engine, on the user's own provider
 account — the server never holds the user's provider credentials.
-One daemon hosts **many independent agents** — each with its own isolated
+One daemon hosts **many independent agents** — each with its own dedicated
 home directory, memory, skills, and notes. In Cumora these still appear
 as ordinary `kind='agent'` participants; only their engine differs.
 
+Claude Code and Codex are the secure-default engines. The other adapters are
+retained for compatibility but require an explicit unsandboxed opt-in described
+below; detecting their binary on `PATH` is not enough to execute them.
+
 The key property that makes this cheap: **Cumora's I/O surface is fully
 decoupled from the brain.** The same `cumora` CLI an agent uses for every
-world action (`reply`, `dm`, `memory`, `workspace`, `card`, …) is a thin
-shim that POSTs argv to `/runtime/cli`, and the transport (wake-stream
-SSE + `/runtime/cli`) is deployment-agnostic. BYOA swaps the brain and
-the host; it reuses everything else.
+world action (`reply`, `dm`, `memory`, `workspace`, `card`, …) is a thin,
+fixed MCP-to-file-IPC bridge. It sends argv to the local daemon, and only the daemon —
+outside the model sandbox — holds the runtime JWT and POSTs to
+`/runtime/cli`. BYOA swaps the brain and the host; it reuses everything
+else without handing server credentials or arbitrary network access to
+model-generated commands.
 
 > Distilled coordination lessons — how N of these engines share a room
 > without colliding — live in [`COORDINATION.md`](COORDINATION.md). This
@@ -82,7 +88,7 @@ There is no "special" BYOA agent, only agents on different Computers.
         cumora agent computer (daemon, laptop/VPS) ◄──────────┘ SSE
         debounce → small-brain triage → persistent engine session turn
         the engine IS the loop (its own context, tools, compaction)
-        bash → `cumora` shim → /runtime/cli → DB   (unchanged)
+        sandboxed tool → local file IPC → daemon → /runtime/cli → DB
 ```
 
 `turn.ts` is **bypassed entirely** for BYOA agents. There is no
@@ -112,16 +118,18 @@ with rate-limit adaptation, and same-turn steering.
               │   wake → debounce/coalesce → triage (small brain)       │
               │        → persistent EngineSession turn                  │
               │   claude --input/output-format stream-json …            │
-              │   codex app-server / grok ACP / cursor/opencode run     │
+              │   codex exec / optional compatibility engines          │
               │   pi --mode rpc (JSON commands + events over stdio)     │
-              │   bash → cumora shim → POST /runtime/cli (per-agent JWT)│
+              │   tool → file IPC → daemon POST /runtime/cli (JWT)      │
               └─────────────────────────────────────────────────────────┘
 ```
 
 **One computer, many agents.** Each agent gets one wake-stream
 subscription, one engine context (persistent process where supported, resumable
-session id otherwise), and one isolated on-disk home. Agents never share state — isolation is "different directory +
-different token".
+session id otherwise), and one dedicated on-disk home. The model process
+receives neither the runtime token nor the server URL. Authorization stays in
+the daemon; filesystem and command-network isolation are enforced by the
+selected engine's sandbox.
 
 ---
 
@@ -153,14 +161,16 @@ different token".
    roster. The invariant scaffold (CLI usage, the shared
    `GLANCE_YIELD_RULES`, memory rules, privacy boundary) is delivered
    once per persistent session out-of-band — `--append-system-prompt-file`
-   for Claude, `developerInstructions` for Codex, `_meta.rules` for Grok
-   ACP. Cursor and OpenCode have no supported persistent protocol in the tested
-   CLI versions, so the daemon inlines the standing prompt into each one-shot
-   wake.
+   for Claude. Secure-default Codex uses a one-shot `exec` because its
+   app-server currently cannot exclude user config, MCP, hook, and rule layers.
+   Compatibility engines retain their native standing-prompt behavior only
+   after the operator explicitly enables unsandboxed BYOA.
 6. The engine reads its home (`CLAUDE.md` / `AGENTS.md`, skills,
-   `memory/`), reasons, and acts through bash: every `cumora …` call
-   flows through the shim to `/runtime/cli` with identity pinned by the
-   per-agent JWT.
+   `memory/`), reasons, and acts through its allowed tools. Every `cumora …`
+   call flows through a per-agent request/response directory outside the
+   writable model home to the daemon;
+   the daemon attaches the in-memory per-agent JWT and forwards it to
+   `/runtime/cli`.
 7. **Same-turn steering.** A DM / @mention / human message arriving
    mid-turn is injected into the live session at the next safe stream
    boundary; plain group activity gets a content-free nudge (default
@@ -207,12 +217,14 @@ interface EngineSession {
 
 | Concern | Claude Code | Codex CLI | Grok Build | Cursor Agent | OpenCode | pi | Gemini CLI |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Persistent session | `claude -p --input-format stream-json --output-format stream-json --verbose [--resume <id>] [--model X]` | `codex app-server --listen stdio://`, driven over JSON-RPC (`thread/start` / `thread/resume`) | `grok agent --always-approve --no-leader … stdio`, driven over ACP | none in Cursor Agent `2026.08.11-e8db854` | none in the supported OpenCode `v1.18.20` contract; a new process resumes with `--session <id>` | `pi --mode rpc --session-id <id> --skill <home>/.pi/skills`; a turn is a `prompt` command, done at `agent_settled`; steering is pi's native `steer` | none — Gemini CLI `0.57.0` has no stream-json INPUT mode, so there is no way to feed turn N+1 into a live process |
-| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | `developerInstructions` on `thread/start` | ACP `_meta.rules` | inlined into each wake | inlined into each wake | `--append-system-prompt <home>/.cumora-standing-prompt.md` | inlined into each wake |
-| One-shot fallback | `claude -p … --output-format stream-json` | `codex exec … --skip-git-repo-check` | `grok -p … --output-format streaming-messages-json` | `cursor-agent -p --output-format stream-json --force --trust [--resume <id>]` | `opencode run --format json --auto [--session <id>] [--model provider/model]` (prompt on stdin) | `pi <CUMORA_PI_ARGS> --session-id <id> -p` (print mode) | `gemini --output-format stream-json --yolo [--resume <uuid>] [--model X]` (prompt on stdin; `GEMINI_CLI_TRUST_WORKSPACE=true`) |
-| Fallback triggers | `CUMORA_CLAUDE_ARGS` set | `CUMORA_CODEX_ARGS` set, `CUMORA_CODEX_NO_APP_SERVER=1`, Windows, or git-init failure | `CUMORA_GROK_ARGS` set, `CUMORA_GROK_NO_ACP=1`, or Windows | always one-shot; `CUMORA_CURSOR_ARGS` overrides flags | always one-shot; `CUMORA_OPENCODE_ARGS` overrides run flags | `CUMORA_PI_ARGS` set | always one-shot; `CUMORA_GEMINI_ARGS` overrides run flags |
+| Secure default | Claude Code ≥ 2.1.248 with `--restricted`; no Bash/PowerShell/web tools; host-home reads, command network, unsandboxed retry, and subprocess credentials are denied | Codex ≥ 0.138.0 with a custom permission profile: only minimal runtime reads plus the agent home; command network disabled; tool env allowlisted; user/project config, rules, hooks, apps, remote plugins, and multi-agent tools ignored or disabled | disabled | disabled | disabled | disabled | disabled |
+| Platform | macOS, Linux, WSL2; native Windows disabled because Claude's sandbox is unsupported there | macOS, Linux, WSL2, native Windows | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only |
+| Persistent session | secure default; `claude -p --input-format stream-json --output-format stream-json --verbose` | compatibility opt-in only; secure default uses one-shot `exec` | compatibility opt-in ACP | none | none | compatibility opt-in RPC | none |
+| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | inlined into each secure one-shot wake | compatibility ACP `_meta.rules` | inlined | inlined | compatibility `--append-system-prompt` | inlined |
+| One-shot | sandboxed `claude -p … --output-format stream-json` | sandboxed `codex exec --ignore-user-config --ignore-rules …` | compatibility `grok -p … --always-approve` | compatibility `cursor-agent … --force --trust` | compatibility `opencode run … --auto` | compatibility `pi … -p` | compatibility `gemini … --yolo` |
+| Custom argv | ignored securely; requires the compatibility opt-in | ignored securely; requires the compatibility opt-in | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required |
 | Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` plus `.opencode/skills/` | `AGENTS.md` plus `.pi/skills/` (loaded via `--skill`) | `GEMINI.md` plus `.gemini/skills/` |
-| Triage (small brain) | `claude -p --model haiku --output-format json` | `codex exec --model gpt-5.4-mini` | `grok -p --model grok-4.5 --output-format json` | `cursor-agent --mode ask -p --output-format stream-json --trust` | `opencode run --format json --agent cumora-triage`; the injected agent denies every tool permission | `pi --mode json --no-session --no-tools --no-extensions --no-skills --no-context-files [--model $CUMORA_TRIAGE_MODEL]` (multi-provider — no fixed cheap model; unset → pi's default) | `gemini --output-format stream-json --model gemini-2.5-flash-lite` with system settings `tools.core: []` and `mcp.allowed: []`, blocking built-in and user/extension MCP tools |
+| Triage (small brain) | restricted and tool-free | read-only custom profile and tool env | compatibility only | compatibility only | compatibility only | compatibility only | compatibility only |
 
 Sessions carry a resume id (`~/.cumora/sessions/<agentId>.session`); a
 failed resume falls back to a fresh thread instead of wedging the agent.
@@ -227,8 +239,8 @@ unknown flag as fatal. And Gemini's `stats.input_tokens` is the whole prompt
 INCLUDING cache reads, while `stats.input` is the fresh remainder; the ledger
 bills `input` and reports `cached` separately, so a cached prefix is not
 charged twice.
-Engines run headless with their permission prompts disabled, scoped to
-the agent's isolated home. On Windows the daemon resolves the real
+Secure-default engines run headless inside a fail-closed local sandbox; an
+unavailable sandbox stops the turn instead of widening access. On Windows the daemon resolves the real
 `claude`/`codex`/`grok`/`cursor-agent`/`opencode`/`pi`/`gemini` `.cmd` shims and routes large
 prompts via stdin. OpenCode JSONL `step_finish` events are recorded as individual
 provider hops; uncached input, output+reasoning, and cache read/write tokens map
@@ -237,6 +249,40 @@ final `step_finish` against the terminal idle event, so a clean process exit is
 the completion signal and accounting is best-effort when that event is absent.
 Model selection: the per-agent `participants.model` / `fast_model`
 columns, else the matching deploy-level `CUMORA_DEFAULT_*_MODEL` pin.
+
+### Secure default and compatibility opt-in
+
+The daemon advertises and schedules only engines for which it can impose a
+fail-closed host boundary:
+
+- Claude Code on macOS, Linux, and WSL2 runs in restricted mode with filesystem
+  isolation, an empty strict network allowlist, no Bash/PowerShell/web tools,
+  no unsandboxed retry, and an explicit deny list for every inherited
+  environment variable not needed by the fixed Cumora MCP bridge. Claude Code
+  2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
+  `socat`; a missing dependency fails the turn.
+- Codex runs one-shot with user config and exec-policy rules ignored. A custom
+  permission profile permits minimal runtime reads and writes only under the
+  agent home, disables command network, and gives model-spawned commands only
+  an explicit non-secret environment. The agent home is marked untrusted at
+  CLI precedence, and hooks, apps, remote plugins, multi-agent tools, web
+  search, and shell snapshots are disabled. Codex 0.138.0 or newer is required.
+
+Grok, Cursor, OpenCode, pi, Gemini, and Claude on native Windows remain
+available only as a backwards-compatibility escape hatch. They are not merely
+hidden in the UI: the daemon removes them from its runnable inventory, so a
+server assignment cannot make one execute accidentally.
+
+```bash
+# HIGH RISK: model-generated tools inherit the host's ordinary file/network
+# authority. Use only inside an external container or VM you trust as the real
+# security boundary.
+CUMORA_BYOA_ALLOW_UNSANDBOXED=1 cumora agent computer
+```
+
+This opt-in also re-enables `CUMORA_*_ARGS` whole-argv overrides and Codex's
+persistent app-server path. Without it, opaque engine arguments are ignored
+because the daemon cannot prove that they preserve the sandbox.
 
 ### Running against a custom provider
 
@@ -272,26 +318,38 @@ CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
   daemon.log
   sessions/<agentId>.session       ← engine resume id
   triage/                          ← neutral cwd for small-brain spawns
-  agents/<agentId>/                ← cwd for every engine turn; isolated
-    CLAUDE.md  (or AGENTS.md)      ← static persona header, written once
+  .runtime-cli-tools/<agentId>/    ← daemon-owned fixed MCP bridge + IPC client
+    cumora-mcp
+    cumora
+  .runtime-cli-ipc/<agentId>/      ← credential-free rendezvous outside model home
+    requests/                      ← bounded argv requests
+    responses/                     ← bounded daemon responses
+  .runtime-cli-broker/<agentId>/   ← daemon-private claimed requests/staging
+  agents/<agentId>/                ← cwd and secure sandbox root
+    CLAUDE.md  (or AGENTS.md)      ← daemon-owned persona, atomically refreshed
     .cumora-standing-prompt.md     ← the per-session operational prompt
     .claude/skills/<name>/SKILL.md ← this agent's skills (Claude)
     .cursor/skills/                 ← Cursor-native skill directory
     .opencode/skills/               ← OpenCode-native skill directory
     .gemini/skills/                 ← Gemini-native skill directory
     .pi/skills/                     ← pi-native skill directory (via --skill)
-    .claude/settings.json          ← permissions (allow Bash)
-    bin/cumora                     ← the shim (see below); bin/.runtime-token
+    bin/cumora                     ← compatibility mode only
     memory/MEMORY.md               ← the agent's durable memory index
     notes/                         ← scratch notes
     workspace/                     ← local work files
 ```
 
-**The shim** is a small self-contained Node script the daemon writes to
-`<home>/bin/cumora` and prepends to the engine's `PATH`. It POSTs argv to
-`/runtime/cli`, reads its token from `bin/.runtime-token` (refreshed by
-the daemon before expiry), and supports `--file <path>` / `--stdin` to
-pass long bodies without shell mangling. (The similar
+**The bridge** is a fixed MCP server plus a small file-IPC client stored in the
+daemon-owned `.runtime-cli-tools/<agentId>/` directory, outside the writable
+agent home. Secure Claude and Codex expose only its structured `cli(argv)` tool;
+the model cannot rewrite the executable or write directly into the rendezvous
+directories. The bridge sends bounded argv through
+`.runtime-cli-ipc/<agentId>/`, and the daemon atomically claims each request
+into its private broker directory before validating it, refreshing its
+in-memory JWT, and POSTing `/runtime/cli`. The model process receives no server
+URL, bearer token, or HTTP client path. Compatibility mode retains the legacy
+`<home>/bin/cumora` PATH shim and its `--file <path>` / `--stdin` conveniences.
+(The similar
 `server/docker/agent-computer-cumora.sh` curl shim is the **cloud pod**
 variant, injected by the orchestrator — same protocol, different host.)
 
@@ -303,14 +361,17 @@ also works for BYOA agents through `/runtime/cli` — `cumora workspace`
 shared artifacts live where teammates can see them, while the agent's
 inner state stays local.
 
-**Isolation is cwd-scoped, auth is shared.** Relocating the engine's
-config dir (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`) breaks its login —
-credentials are keyed to that dir — so the daemon sets `cwd` to the
-agent's home and does **not** relocate config. Per-agent: project memory,
-skills, settings, notes, workspace. Shared across an owner's agents on
-one machine: the engine login and the user's global config (`~/.claude` /
-`~/.codex` / `~/.grok` / `~/.pi/agent` / `~/.gemini`, Cursor's login store, or OpenCode's config/auth store).
-Agents are independent in all project state and share one engine login per host.
+**Authentication is shared; tool authority is not.** The engine core can use
+the operator's existing login, but model-spawned commands cannot read that
+login or inherit provider credentials in secure mode. Each agent gets its own
+writable home; its credential-free IPC namespace and executable bridge stay
+outside that home. Claude restricted mode ignores user/project settings while
+retaining core authentication; Codex `exec --ignore-user-config --ignore-rules`
+does the same and marks the project untrusted. Secure engine startup also drops
+empty, relative, and agent-home entries from `PATH`, so a model-planted
+`claude`/`codex` executable cannot run before the next sandbox is established.
+Compatibility mode intentionally restores the older shared-host trust model
+and must be protected by an external container or VM.
 
 ---
 
@@ -360,8 +421,8 @@ not the user's session. "Remove Computer" is a real kill switch.
                                               hashed server-side)
 4. daemon: GET /api/computers/me/agents (roster, re-polled every 60s);
    per agent it mints a short-lived runtime JWT (2h TTL, refreshed before
-   expiry) via POST /api/agents/:id/runtime-token — used for that agent's
-   wake-stream SSE and the cumora shim.
+   expiry) via POST /api/agents/:id/runtime-token — kept in daemon memory and
+   used for that agent's wake-stream SSE and daemon-side `/runtime/cli` calls.
 5. heartbeat: POST /api/computers/heartbeat every 30s; a computer with no
    heartbeat for 90s shows offline and its agents show sleeping.
 6. UI "Remove" ─► sets revoked_at; the device token and all derived agent
@@ -432,9 +493,18 @@ npx cumora@latest agent computer --pair <code> [--server <url>]
   and skills in the agent home are inspectable on the machine, not in
   the Cumora UI. Shared work belongs in server-side surfaces (`cumora
   workspace`, docs, boards) where teammates can see it.
-- **The runtime token is a credential** for that agent's identity: short
-  TTL + refresh bounds leakage; revoking the computer kills all derived
-  tokens.
-- **Engines run with their permission prompts disabled** inside the
-  agent's home. The blast radius is bounded by the home directory plus
-  whatever the `cumora` CLI (server-arbitrated, identity-pinned) allows.
+- **The runtime token is a credential** for that agent's identity. It remains
+  in daemon memory and never enters the engine environment or agent home;
+  short TTL and computer revocation remain defense in depth.
+- **Secure-default engine tools are OS-sandboxed.** They can modify the agent
+  home and invoke only the fixed Cumora MCP tool, but cannot rewrite its bridge,
+  read the rest of the host, inherit daemon/provider secrets, or open
+  command-network connections. Persona and standing-prompt refreshes are
+  atomic and refuse linked state directories. Runner replacement waits for the
+  platform tree terminator before reseeding: POSIX uses a dedicated process
+  group plus bounded descendant discovery for children that detach from it;
+  Windows waits for `taskkill /T /F` to finish.
+- **Unsandboxed compatibility is explicit and loud.** Setting
+  `CUMORA_BYOA_ALLOW_UNSANDBOXED=1` restores the historical host-level blast
+  radius and emits a startup warning; operators should use it only behind an
+  external VM/container boundary.

@@ -14,9 +14,9 @@
  *   - per-agent runtime JWTs minted for a paired device (reuses
  *     runtime/jwt.ts — the same token a pod gets)
  */
-import { randomUUID, randomBytes, createHash } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { pool } from '../../db/pool.js'
-import { publish, CH_STATUS } from '../../redis.js'
+import { CH_STATUS, publish } from '../../redis.js'
 import { signAgentToken } from '../runtime/jwt.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
@@ -488,7 +488,7 @@ export async function resolveDevice(token: string): Promise<{ computerId: string
 /** Mint a short-lived per-agent runtime JWT for a paired device — but only if
  *  the agent is actually assigned to that device's computer (same company).
  *  This is the credential the daemon uses for the agent's wake-stream SSE and
- *  as CUMORA_AGENT_RUNTIME_TOKEN for the `cumora` shim. */
+ *  daemon-side runtime calls. It never enters the model process or agent home. */
 export async function mintAgentRuntimeToken(args: {
   computerId: string
   agentId: string

@@ -5,30 +5,32 @@
  * on the user's machine: Claude Code, Codex, Grok Build, Cursor Agent,
  * OpenCode, or pi. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
- * isolated home directory. The engine reads its persona + memory + skills
+ * dedicated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
- * on Cumora through the `cumora` shim the daemon puts on its PATH.
+ * on Cumora through a fixed MCP bridge. The historical PATH shim remains only
+ * in explicitly unsandboxed compatibility mode.
  *
  * This module is intentionally standalone — only Node builtins — so the
  * daemon can run on a machine with no Cumora DB/Redis access.
  *
  * NOTE on engine flags: the exact non-interactive / permission flags differ
- * across engine versions. We pick sensible defaults for an isolated,
- * user-owned runner and let the user override via env
+ * across engine versions. Claude and Codex run with fail-closed host boundaries
+ * by default. Engines without a verified boundary, and opaque argv overrides,
+ * require the explicit CUMORA_BYOA_ALLOW_UNSANDBOXED=1 compatibility opt-in
  * (CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS / CUMORA_GROK_ARGS /
  *  CUMORA_CURSOR_ARGS / CUMORA_OPENCODE_ARGS / CUMORA_PI_ARGS, space-split). Correctness of the
  * loop does not depend on the structured output — the agent acts via the
  * `cumora` tool regardless of how we parse stdout.
  */
-import { spawn as nodeSpawn, execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process'
+import { type ChildProcess, execFile, execFileSync, spawn as nodeSpawn, type SpawnOptions } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, writeFile, access, mkdtemp, rename } from 'node:fs/promises'
-import { existsSync, writeFileSync } from 'node:fs'
+import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { access, lstat, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { join, delimiter as PATH_DELIMITER } from 'node:path'
+import { dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
-import { probeEngineVersion } from './cli-version.js'
+import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersion } from './cli-version.js'
 
 const IS_WIN = process.platform === 'win32'
 
@@ -46,6 +48,210 @@ export function headlessSpawnOptions(options: SpawnOptions = {}): SpawnOptions {
 
 function spawn(command: string, args: string[], options: SpawnOptions = {}): ChildProcess {
   return nodeSpawn(command, args, headlessSpawnOptions(options))
+}
+
+/** Model tools may spawn descendants that outlive the CLI parent. Put every
+ * engine process in its own POSIX process group, and terminate the complete
+ * tree on cancellation. Windows has no process-group signal equivalent, so
+ * taskkill /T supplies the platform's tree semantics. */
+function spawnEngineChild(command: string, args: string[], options: SpawnOptions = {}): ChildProcess {
+  return spawn(command, args, { ...options, detached: !IS_WIN })
+}
+
+interface EngineTerminationState {
+  forceRequested: boolean
+  promise: Promise<void>
+}
+
+const engineTerminations = new WeakMap<ChildProcess, EngineTerminationState>()
+
+function childHasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null
+}
+
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (childHasExited(child)) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (exited: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      child.off('close', onClose)
+      child.off('error', onClose)
+      resolve(exited)
+    }
+    const onClose = () => finish(true)
+    const timer = setTimeout(() => finish(childHasExited(child)), timeoutMs)
+    timer.unref?.()
+    child.once('close', onClose)
+    child.once('error', onClose)
+  })
+}
+
+function readProcessTable(): Promise<Map<number, number>> {
+  return new Promise((resolve) => {
+    execFile('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+      const table = new Map<number, number>()
+      if (!err) {
+        for (const line of stdout.split('\n')) {
+          const match = line.trim().match(/^(\d+)\s+(\d+)$/)
+          if (match) table.set(Number(match[1]), Number(match[2]))
+        }
+      }
+      resolve(table)
+    })
+  })
+}
+
+function expandDescendants(tracked: Set<number>, table: ReadonlyMap<number, number>): void {
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const [pid, parent] of table) {
+      if (!tracked.has(pid) && tracked.has(parent)) {
+        tracked.add(pid)
+        changed = true
+      }
+    }
+  }
+}
+
+function signalPid(pid: number, signal: NodeJS.Signals): void {
+  try { process.kill(pid, signal) } catch { /* process already exited */ }
+}
+
+function anyPidAlive(pids: ReadonlySet<number>): boolean {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch { /* process is gone */ }
+  }
+  return false
+}
+
+function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid
+  if (!pid) {
+    try { child.kill(signal) } catch { /* already gone */ }
+    return
+  }
+  try { process.kill(-pid, signal) }
+  catch { try { child.kill(signal) } catch { /* already gone */ } }
+}
+
+async function terminateWindowsTree(child: ChildProcess): Promise<void> {
+  const pid = child.pid
+  if (!pid) return
+  await new Promise<void>((resolve) => {
+    execFile(
+      'taskkill.exe', ['/pid', String(pid), '/t', '/f'],
+      headlessSpawnOptions({ windowsHide: true }),
+      (err) => {
+        if (err && !childHasExited(child)) {
+          try { child.kill('SIGKILL') } catch { /* already gone */ }
+        }
+        resolve()
+      },
+    )
+  })
+  await waitForChildExit(child, 1_500)
+}
+
+async function terminatePosixTree(
+  child: ChildProcess,
+  state: EngineTerminationState,
+): Promise<void> {
+  const rootPid = child.pid
+  if (!rootPid) return
+  const tracked = new Set<number>([rootPid])
+
+  // Snapshot before signalling the group. A child may deliberately call
+  // setsid()/setpgid() and escape the engine's PGID while retaining the engine
+  // as its parent; explicit descendant signals cover that case.
+  expandDescendants(tracked, await readProcessTable())
+  const initialSignal: NodeJS.Signals = state.forceRequested ? 'SIGKILL' : 'SIGTERM'
+  for (const pid of [...tracked].reverse()) signalPid(pid, initialSignal)
+  signalProcessGroup(child, initialSignal)
+
+  if (!state.forceRequested) {
+    await waitForChildExit(child, 1_000)
+    // The engine parent may exit promptly while a detached descendant ignores
+    // SIGTERM. Do not mistake the parent's close event for completion of the
+    // previously discovered tree.
+    if (!anyPidAlive(tracked)) return
+  }
+
+  // Re-scan before escalating. Descendants recorded in `tracked` stay targets
+  // even if their parent exits and init adopts them between scans.
+  expandDescendants(tracked, await readProcessTable())
+  for (const pid of [...tracked].reverse()) signalPid(pid, 'SIGKILL')
+  signalProcessGroup(child, 'SIGKILL')
+
+  // A terminating process can race one final fork with the first snapshot.
+  // Bounded rescans catch descendants of every still-known PID without turning
+  // shutdown into an unbounded wait or signalling unrelated processes later.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expandDescendants(tracked, await readProcessTable())
+    let survivor = false
+    for (const pid of tracked) {
+      try {
+        process.kill(pid, 0)
+        survivor = true
+        signalPid(pid, 'SIGKILL')
+      } catch { /* process is gone */ }
+    }
+    if (!survivor) break
+  }
+  // Wait for killed PIDs to disappear from the process table (including a
+  // briefly reparented zombie). `stop()` must not resolve while a known old
+  // descendant can still run beside the replacement runner.
+  for (let attempt = 0; attempt < 40 && anyPidAlive(tracked); attempt += 1) {
+    for (const pid of tracked) signalPid(pid, 'SIGKILL')
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  await waitForChildExit(child, 1_500)
+}
+
+/** Terminate an engine and wait for the platform's tree operation to finish.
+ * Calls are idempotent; a later force request escalates an in-progress graceful
+ * stop. Runner replacement awaits this promise before reseeding model-writable
+ * state or launching the next engine. */
+function terminateEngineTree(child: ChildProcess, force = false): Promise<void> {
+  const current = engineTerminations.get(child)
+  if (current) {
+    if (force) current.forceRequested = true
+    return current.promise
+  }
+  const state: EngineTerminationState = { forceRequested: force, promise: Promise.resolve() }
+  state.promise = (IS_WIN ? terminateWindowsTree(child) : terminatePosixTree(child, state))
+    .catch(() => {
+      try { child.kill('SIGKILL') } catch { /* already gone */ }
+    })
+  engineTerminations.set(child, state)
+  return state.promise
+}
+
+/** Bind an AbortSignal to one engine child and retain the exact termination
+ * promise. One-shot helpers must await `wait()` before resolving an aborted
+ * operation; otherwise AgentRunner's active-run barrier can finish while the
+ * platform tree terminator is still working. */
+function bindAbortTermination(
+  child: ChildProcess,
+  signal: AbortSignal,
+): { dispose: () => void; wait: () => Promise<void> } {
+  let termination: Promise<void> | null = null
+  const onAbort = (): void => {
+    if (!termination) termination = terminateEngineTree(child, true)
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  if (signal.aborted) onAbort()
+  return {
+    dispose: () => signal.removeEventListener('abort', onAbort),
+    wait: () => termination ?? Promise.resolve(),
+  }
 }
 
 // Optional last-resort cap on a single persistent-engine turn. DEFAULT OFF (0):
@@ -116,6 +322,89 @@ export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi
 /** The pairable engine ids, in the daemon's default detection order. */
 export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini']
 
+/** Engines for which Cumora can impose a fail-closed filesystem + tool-network
+ * boundary non-interactively. The remaining adapters still work for operators
+ * who explicitly accept host-level execution, but are never selected merely
+ * because their binary happens to be on PATH. */
+export const SANDBOXED_ENGINE_IDS: readonly EngineId[] = ['claude', 'codex']
+export const ALLOW_UNSANDBOXED_BYOA_ENV = 'CUMORA_BYOA_ALLOW_UNSANDBOXED'
+export const SECURE_ENGINE_MIN_VERSIONS: Readonly<Partial<Record<EngineId, string>>> = {
+  // --restricted first shipped here; it is what ignores user/project settings
+  // and confines built-in file tools to the Agent working directory.
+  claude: '2.1.248',
+  // Permission profiles (default_permissions / permissions.*) are supported
+  // starting with this Codex release.
+  codex: '0.138.0',
+}
+
+export function allowUnsandboxedByoa(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[ALLOW_UNSANDBOXED_BYOA_ENV] === '1'
+}
+
+export function runnableEngineIds(
+  installed: readonly EngineId[],
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): EngineId[] {
+  if (allowUnsandboxedByoa(env)) return [...installed]
+  const safe = new Set(SANDBOXED_ENGINE_IDS)
+  return installed.filter((id) => safe.has(id) && !(platform === 'win32' && id === 'claude'))
+}
+
+export interface RunnableEngineEvaluation {
+  runnable: EngineId[]
+  blocked: Array<{ id: EngineId; reason: string }>
+}
+
+export function secureEngineCapabilityReason(
+  id: EngineId,
+  version: string | null,
+  platform: NodeJS.Platform,
+  linuxSandboxDeps: { bwrap: boolean; socat: boolean } = { bwrap: true, socat: true },
+): string | null {
+  const minimum = SECURE_ENGINE_MIN_VERSIONS[id]
+  if (!minimum || !isCliVersionAtLeast(version, minimum)) {
+    return version
+      ? `version ${version} is older than the secure minimum ${minimum ?? 'unknown'}`
+      : `could not verify the installed version (secure minimum ${minimum ?? 'unknown'})`
+  }
+  if (id === 'claude' && platform === 'linux' && (!linuxSandboxDeps.bwrap || !linuxSandboxDeps.socat)) {
+    const missing = [!linuxSandboxDeps.bwrap && 'bubblewrap (bwrap)', !linuxSandboxDeps.socat && 'socat'].filter(Boolean).join(', ')
+    return `missing sandbox dependency: ${missing}`
+  }
+  return null
+}
+
+/** Fail-closed capability check layered on top of the static engine allowlist.
+ * Merely having a binary named `claude` or `codex` is insufficient: older
+ * releases silently ignore the exact boundary controls Cumora depends on. */
+export async function evaluateRunnableEngines(
+  installed: readonly EngineId[],
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Promise<RunnableEngineEvaluation> {
+  const candidates = runnableEngineIds(installed, env, platform)
+  if (allowUnsandboxedByoa(env)) return { runnable: candidates, blocked: [] }
+
+  const snapshot = await snapshotDetectedEngines(candidates)
+  const versions = new Map<EngineId, string | null>(await Promise.all(snapshot.map(async (entry) => [
+    entry.id,
+    await probeLocalEngineVersion(entry.id, entry.path),
+  ] as const)))
+  const linuxSandboxDeps = platform === 'linux'
+    ? { bwrap: await binOnPath('bwrap'), socat: await binOnPath('socat') }
+    : { bwrap: true, socat: true }
+  const runnable: EngineId[] = []
+  const blocked: RunnableEngineEvaluation['blocked'] = []
+  for (const id of candidates) {
+    const version = versions.get(id) ?? null
+    const reason = secureEngineCapabilityReason(id, version, platform, linuxSandboxDeps)
+    if (reason) { blocked.push({ id, reason }); continue }
+    runnable.push(id)
+  }
+  return { runnable, blocked }
+}
+
 export interface EnginePersona {
   id: string
   name: string
@@ -124,7 +413,7 @@ export interface EnginePersona {
 }
 
 export interface EngineRunArgs {
-  /** Agent's isolated home dir; becomes the engine's cwd. */
+  /** Agent's dedicated home dir; becomes the engine's cwd and secure sandbox root. */
   home: string
   /** The per-wake trigger prompt. */
   prompt: string
@@ -318,7 +607,7 @@ export interface EngineSession {
   /** Tear the process down (daemon shutdown / unrecoverable error). `force`
    *  skips any engine-specific graceful-exit delay when this daemon process is
    *  itself about to exit. */
-  stop(options?: { force?: boolean }): void
+  stop(options?: { force?: boolean }): Promise<void>
 }
 
 export interface EngineAdapter {
@@ -376,22 +665,84 @@ async function exists(p: string): Promise<boolean> {
   try { await access(p); return true } catch { return false }
 }
 
+async function ensureAgentDirectory(path: string, recursive = false): Promise<void> {
+  try {
+    const info = await lstat(path)
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error(`secure BYOA refuses non-directory or linked path: ${path}`)
+    }
+    return
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+  }
+  await mkdir(path, { recursive })
+  const created = await lstat(path)
+  if (!created.isDirectory() || created.isSymbolicLink()) {
+    throw new Error(`secure BYOA could not create a trusted directory: ${path}`)
+  }
+}
+
+/** Replace a daemon-owned file without following an attacker-planted final
+ * symlink. The random staging file and target share a verified parent, so the
+ * final rename swaps the directory entry itself rather than opening its target. */
+async function atomicAgentWrite(path: string, data: string): Promise<void> {
+  const parent = dirname(path)
+  const staged = join(parent, `.cumora-${process.pid}-${randomUUID()}.tmp`)
+  await writeFile(staged, data, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+  try {
+    try { await rename(staged, path) }
+    catch (err) {
+      if (!IS_WIN || !['EEXIST', 'EPERM'].includes((err as NodeJS.ErrnoException).code ?? '')) throw err
+      await rm(path, { force: true })
+      await rename(staged, path)
+    }
+  } finally {
+    await rm(staged, { force: true }).catch(() => {})
+  }
+}
+
+function atomicAgentWriteSync(path: string, data: string): void {
+  const parent = dirname(path)
+  const staged = join(parent, `.cumora-${process.pid}-${randomUUID()}.tmp`)
+  writeFileSync(staged, data, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+  try {
+    try { renameSync(staged, path) }
+    catch (err) {
+      if (!IS_WIN || !['EEXIST', 'EPERM'].includes((err as NodeJS.ErrnoException).code ?? '')) throw err
+      rmSync(path, { force: true })
+      renameSync(staged, path)
+    }
+  } finally {
+    rmSync(staged, { force: true })
+  }
+}
+
 async function ensureCommonHome(home: string): Promise<void> {
-  await mkdir(join(home, 'memory'), { recursive: true })
-  await mkdir(join(home, 'notes'), { recursive: true })
-  await mkdir(join(home, 'workspace'), { recursive: true })
+  await ensureAgentDirectory(home, true)
+  await ensureAgentDirectory(join(home, 'memory'))
+  await ensureAgentDirectory(join(home, 'notes'))
+  await ensureAgentDirectory(join(home, 'workspace'))
   // Seed a memory index so "read memory/MEMORY.md to recall" always has a
   // target, and the agent has a concrete place to append pointers. Only when
   // absent — never clobber what the agent has written.
   const memoryIndex = join(home, 'memory', 'MEMORY.md')
-  if (!(await exists(memoryIndex))) {
-    await writeFile(
+  let seedMemoryIndex = false
+  try {
+    const info = await lstat(memoryIndex)
+    if (!info.isFile() || info.isSymbolicLink()) {
+      throw new Error(`secure BYOA refuses non-file or linked memory index: ${memoryIndex}`)
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+    seedMemoryIndex = true
+  }
+  if (seedMemoryIndex) {
+    await atomicAgentWrite(
       memoryIndex,
       '# Memory index\n\n' +
       'One line per durable fact, pointing at the file that holds it:\n' +
       '`- [Title](file.md) — one-line hook`\n\n' +
       'Write the fact itself in its own `memory/<topic>.md` file; keep this index short.\n',
-      'utf8',
     )
   }
 }
@@ -485,7 +836,7 @@ function spawnEngine(
   spawnOpts: { shell?: boolean; stdinText?: string; onStdoutLine?: (line: string) => void } = {},
 ): Promise<EngineRunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, {
+    const child = spawnEngineChild(bin, args, {
       cwd: home, env,
       stdio: [spawnOpts.stdinText != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       shell: spawnOpts.shell ?? false,
@@ -493,13 +844,9 @@ function spawnEngine(
     if (spawnOpts.stdinText != null) {
       writeStdin(child, spawnOpts.stdinText, { end: true })
     }
-    const onAbort = (): void => { child.kill('SIGTERM') }
-    signal.addEventListener('abort', onAbort, { once: true })
-    // A listener registered AFTER the abort event never fires. A turn that was
-    // still queued behind the concurrency gate when its runner was stopped would
-    // otherwise spawn a child nothing owns — with a live runtime token and the
-    // `cumora` shim on PATH.
-    if (signal.aborted) onAbort()
+    // Retain the platform tree-termination promise. A listener registered after
+    // abort would never fire, so bindAbortTermination also closes that race.
+    const abort = bindAbortTermination(child, signal)
 
     const stderrTail: string[] = []
     const stdoutTail: string[] = []
@@ -568,14 +915,20 @@ function spawnEngine(
         onLog(cleaned)
       }
     }
+    let settled = false
     child.stdout?.on('data', (buf: Buffer) => pump('stdout', buf))
     child.stderr?.on('data', (buf: Buffer) => pump('stderr', buf))
-    child.on('error', (err) => { signal.removeEventListener('abort', onAbort); reject(err) })
-    let settled = false
-    const settle = (code: number | null, signalName: NodeJS.Signals | null): void => {
+    child.on('error', (err) => {
       if (settled) return
       settled = true
-      signal.removeEventListener('abort', onAbort)
+      abort.dispose()
+      void abort.wait().then(() => reject(err))
+    })
+    const settle = async (code: number | null, signalName: NodeJS.Signals | null): Promise<void> => {
+      if (settled) return
+      settled = true
+      abort.dispose()
+      await abort.wait()
       const exitCode = code ?? (signalName ? 128 : 1)
       resolve({
         exitCode,
@@ -590,7 +943,7 @@ function spawnEngine(
     // usually the last line, and it carries the turn's usage.
     child.on('close', (code, signalName) => {
       if (!settled) { pump('stdout', null); pump('stderr', null) }
-      settle(code, signalName)
+      void settle(code, signalName)
     })
     // Torn-down end: 'close' waits for every inherited stdio pipe to reach EOF,
     // and the engine's OWN children (Bash tool commands) hold those pipes — a
@@ -599,7 +952,7 @@ function spawnEngine(
     // remaining output is moot, so settle on 'exit' instead. Without this the
     // daemon's shutdown drain waits forever on a turn it already killed, and
     // `busy` plus the big-brain slot are never released.
-    child.on('exit', (code, signalName) => { if (signal.aborted) settle(code, signalName) })
+    child.on('exit', (code, signalName) => { if (signal.aborted) void settle(code, signalName) })
   })
 }
 
@@ -611,7 +964,7 @@ function spawnCapture(
   { cwd, env, signal, onLog, shell, stdinText }: { cwd: string; env: NodeJS.ProcessEnv; signal: AbortSignal; onLog?: (line: string) => void; shell?: boolean; stdinText?: string },
 ): Promise<EngineClassifyResult> {
   return new Promise((resolve) => {
-    const child = spawn(bin, args, {
+    const child = spawnEngineChild(bin, args, {
       cwd, env,
       stdio: [stdinText != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       shell: shell ?? false,
@@ -619,22 +972,30 @@ function spawnCapture(
     if (stdinText != null) {
       writeStdin(child, stdinText, { end: true })
     }
-    const onAbort = (): void => { child.kill('SIGTERM') }
-    signal.addEventListener('abort', onAbort, { once: true })
+    const abort = bindAbortTermination(child, signal)
     let stdout = ''
     const stderrTail: string[] = []
+    let settled = false
     child.stdout?.on('data', (buf: Buffer) => { stdout += buf.toString('utf8'); onLog?.(cleanLine(buf.toString('utf8'))) })
     child.stderr?.on('data', (buf: Buffer) => { for (const l of buf.toString('utf8').split('\n')) pushTail(stderrTail, cleanLine(l)) })
     child.on('error', (err) => {
-      signal.removeEventListener('abort', onAbort)
-      resolve({ text: '', error: err instanceof Error ? err.message : String(err) })
+      if (settled) return
+      settled = true
+      abort.dispose()
+      void abort.wait().then(() => {
+        resolve({ text: '', error: err instanceof Error ? err.message : String(err) })
+      })
     })
     child.on('close', (code, signalName) => {
-      signal.removeEventListener('abort', onAbort)
-      const exitCode = code ?? (signalName ? 128 : 1)
-      resolve({
-        text: stdout.replace(ANSI_RE, '').trim(),
-        error: exitCode === 0 ? undefined : failurePreview({ exitCode, signalName, stderr: stderrTail, stdout: [] }),
+      if (settled) return
+      settled = true
+      abort.dispose()
+      void abort.wait().then(() => {
+        const exitCode = code ?? (signalName ? 128 : 1)
+        resolve({
+          text: stdout.replace(ANSI_RE, '').trim(),
+          error: exitCode === 0 ? undefined : failurePreview({ exitCode, signalName, stderr: stderrTail, stdout: [] }),
+        })
       })
     })
   })
@@ -650,6 +1011,13 @@ function triageModel(fallback: string): string {
 function extraArgs(envVar: string): string[] {
   const raw = process.env[envVar]
   return raw ? raw.split(/\s+/).filter(Boolean) : []
+}
+
+/** Whole-argv overrides are intentionally an unsafe escape hatch: Cumora
+ * cannot prove that an opaque flag set preserves its sandbox. Ignore them in
+ * the secure default mode; the daemon logs the opt-in requirement at startup. */
+function unsafeEngineArgs(envVar: string): string[] {
+  return allowUnsandboxedByoa() ? extraArgs(envVar) : []
 }
 
 const PERSONA_HEADER = (
@@ -685,13 +1053,17 @@ const PERSONA_HEADER = (
   `  people see what you post there.\n` +
   `- If a task seems to need something outside your home, ask in Cumora first;\n` +
   `  don't go fetch it on your own.\n\n` +
-  `When you act in Cumora, use the \`cumora\` command-line tool (already on your\n` +
-  `PATH). Key commands:\n` +
+  `When you act in Cumora, use the \`cumora\` interface. Secure Claude and Codex\n` +
+  `expose it as the structured \`mcp__cumora__cli\` tool (pass command words in its\n` +
+  `\`argv\` array); compatibility engines expose the command-line tool on PATH.\n` +
+  `Key commands:\n` +
   `- \`cumora inbox\` — unread messages across your conversations\n` +
   `- \`cumora messages <conversationId> --tail 30\` — read a conversation\n` +
   `- \`cumora reply <conversationId> '<text>'\` — post a message (SINGLE quotes;\n` +
   `  for anything with backticks, code, $, quotes, or newlines, write it to a file\n` +
-  `  and use \`cumora reply <conversationId> --file <path>\` so the shell can't mangle it)\n` +
+  `  and use \`cumora reply <conversationId> --file <path>\` in command-line mode.\n` +
+  `  In the structured MCP tool, put the complete text directly in one argv item;\n` +
+  `  local \`--file\` and \`--stdin\` flags are intentionally unavailable.)\n` +
   `- \`cumora contacts [<query>]\` — your teammates + humans, each with their role/function\n` +
   `  (search by name or role, e.g. \`cumora contacts designer\`). Use it when someone asks\n` +
   `  about a person or role you don't already know.\n` +
@@ -739,7 +1111,7 @@ class ClaudeSession implements EngineSession {
     // .cmd shim runs (Node can't spawn it with shell:false). The prompt already
     // travels via stdin (stream-json), so no arg-quoting concerns here.
     const { command, shell } = resolveSpawn(bin)
-    this.child = spawn(command, args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell })
+    this.child = spawnEngineChild(command, args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => this.onStderr(b))
     this.child.on('error', (err) => this.die(1, err.message))
@@ -778,10 +1150,10 @@ class ClaudeSession implements EngineSession {
     })
   }
 
-  stop(): void {
+  stop(options: { force?: boolean } = {}): Promise<void> {
     this.exited = true
     try { this.child.stdin?.end() } catch { /* ignore */ }
-    try { this.child.kill('SIGTERM') } catch { /* ignore */ }
+    return terminateEngineTree(this.child, options.force)
   }
 
   /** Same-turn STEERING: queue a message to inject into the
@@ -911,6 +1283,84 @@ class ClaudeSession implements EngineSession {
   }
 }
 
+const TOOL_ENV_ALLOWLIST = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'TMP', 'TEMP',
+  'LANG', 'LANGUAGE', 'TERM', 'COLORTERM', 'NO_COLOR',
+  'CUMORA_AGENT_IPC_DIR', 'CUMORA_AGENT_ID',
+  'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'WINDIR',
+])
+
+function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv): string {
+  const deniedEnv = Object.keys(env)
+    .filter((name) => !TOOL_ENV_ALLOWLIST.has(name.toUpperCase()) && !name.toUpperCase().startsWith('LC_'))
+    .sort()
+    .map((name) => ({ name, mode: 'deny' }))
+  // Claude's command sandbox is write-restricted but read-permissive by
+  // default. Deny user/application data roots, then carve back only this
+  // agent's workspace and executable lookup directories. System runtime paths
+  // (/bin, /usr, /lib, /System) stay readable so the shim can launch.
+  const denyRead = process.platform === 'darwin'
+    ? ['~/', '/Users', '/Volumes']
+    : ['~/', '/home', '/root', '/mnt', '/media', '/run', '/proc', '/sys', '/srv', '/var/lib', '/var/log']
+  const pathDirs = (env.PATH ?? '')
+    .split(PATH_DELIMITER)
+    .filter(Boolean)
+  pathDirs.push(dirname(process.execPath))
+  const allowRead = [...new Set([agentHome, ...pathDirs])]
+  return JSON.stringify({
+    permissions: {
+      defaultMode: 'dontAsk',
+      // Restricted mode confines file tools to the working directory. Keep the
+      // permission rules scoped too, so this JSON remains fail-closed if a
+      // future Claude release changes a restricted-mode default.
+      allow: ['Read(/**)', 'Edit(/**)', 'mcp__cumora__cli'],
+      // The MCP bridge runs as a trusted daemon helper outside the command
+      // sandbox. The model must never rewrite either helper executable.
+      deny: ['Read(/bin/**)', 'Edit(/bin/**)', 'Bash', 'PowerShell', 'WebFetch', 'WebSearch'],
+    },
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      autoAllowBashIfSandboxed: true,
+      filesystem: {
+        denyRead,
+        allowRead,
+      },
+      network: { allowedDomains: [], strictAllowlist: true },
+      credentials: { envVars: deniedEnv },
+    },
+  })
+}
+
+function claudeSecureMcpConfig(env: NodeJS.ProcessEnv): string {
+  const mcpShim = env.CUMORA_AGENT_MCP_SHIM
+  if (!mcpShim) throw new Error('secure Cumora MCP bridge is not configured')
+  return JSON.stringify({
+    mcpServers: {
+      cumora: {
+        command: process.execPath,
+        args: [mcpShim],
+        env: {
+          CUMORA_AGENT_IPC_DIR: env.CUMORA_AGENT_IPC_DIR ?? '',
+        },
+      },
+    },
+  })
+}
+
+function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv): string[] {
+  return [
+    '--restricted',
+    '--permission-mode', 'dontAsk',
+    '--tools', 'Read,Write,Edit,Glob,Grep,mcp__cumora__cli',
+    '--disallowedTools', 'Bash,PowerShell,WebFetch,WebSearch',
+    '--settings', claudeSecureSettings(agentHome, env),
+    '--mcp-config', claudeSecureMcpConfig(env),
+    '--strict-mcp-config',
+  ]
+}
+
 class ClaudeAdapter implements EngineAdapter {
   readonly id = 'claude' as const
   readonly bin = 'claude'
@@ -924,7 +1374,7 @@ class ClaudeAdapter implements EngineAdapter {
     // --output-format json wraps the reply in a result envelope that ALSO carries
     // token usage (incl. cache_read/cache_creation) → we unwrap `.result` as the
     // text and pass `.usage` up for the triage cost ledger.
-    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    const flags = unsafeEngineArgs('CUMORA_TRIAGE_ARGS')
     const model = ['--model', args.model || 'haiku']
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const usingJson = flags.length === 0
@@ -934,7 +1384,9 @@ class ClaudeAdapter implements EngineAdapter {
     // before (unchanged).
     const base = flags.length
       ? [...flags, '-p']
-      : ['-p', ...model, '--output-format', 'json', '--dangerously-skip-permissions', '--strict-mcp-config']
+      : allowUnsandboxedByoa()
+        ? ['-p', ...model, '--output-format', 'json', '--dangerously-skip-permissions', '--strict-mcp-config']
+        : ['-p', ...model, '--output-format', 'json', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     const res = await spawnCapture(command, argv, {
       cwd: args.cwd,
@@ -963,7 +1415,9 @@ class ClaudeAdapter implements EngineAdapter {
     // and that tier is authed/has quota, with NO tools/MCP/persona.
     const model = args.tier === 'small' ? ['--model', triageModel('haiku')] : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
-    const base = ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
+    const base = allowUnsandboxedByoa()
+      ? ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
+      : ['-p', ...model, '--output-format', 'text', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     return spawnCapture(command, argv, {
       cwd: args.cwd,
@@ -978,7 +1432,7 @@ class ClaudeAdapter implements EngineAdapter {
     // Skipped when a CUMORA_CLAUDE_ARGS override is set — startSession() returns
     // null then, so the wake collapses to run() / one-shot exec, which probe()
     // already covers. The honest signal here is just "redundant".
-    if (extraArgs('CUMORA_CLAUDE_ARGS').length) {
+    if (unsafeEngineArgs('CUMORA_CLAUDE_ARGS').length) {
       return { ok: true, detail: '', skipped: true }
     }
     // The realistic break on the persistent-session path is `--append-system-prompt-file`
@@ -992,10 +1446,12 @@ class ClaudeAdapter implements EngineAdapter {
     try { await writeFile(promptFile, '', 'utf8') }
     catch (err) { return { ok: false, detail: `could not write standing-prompt probe file: ${err instanceof Error ? err.message : String(err)}` } }
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
-    const base = [
-      '-p', '--output-format', 'text', '--append-system-prompt-file', promptFile,
-      '--dangerously-skip-permissions',
-    ]
+    const base = allowUnsandboxedByoa()
+      ? ['-p', '--output-format', 'text', '--append-system-prompt-file', promptFile, '--dangerously-skip-permissions']
+      : [
+          '-p', '--output-format', 'text', '--append-system-prompt-file', promptFile,
+          '--restricted', '--tools', '', '--strict-mcp-config',
+        ]
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     const r = await spawnCapture(command, argv, {
       cwd: args.cwd,
@@ -1012,26 +1468,29 @@ class ClaudeAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    await mkdir(join(home, '.claude', 'skills'), { recursive: true })
+    await ensureAgentDirectory(join(home, '.claude'))
+    await ensureAgentDirectory(join(home, '.claude', 'skills'))
     // Always (re)written from the DB's name/role/systemPrompt — this file is
     // system-owned, not agent-editable, so it's safe to overwrite on every
     // start()/restart (including the restart configMatches() triggers when
     // the operator edits the agent's persona in Cumora).
-    await writeFile(join(home, 'CLAUDE.md'), PERSONA_HEADER(persona), 'utf8')
-    // settings.json lets bash (hence the cumora shim) run without prompts in
-    // this isolated home. Only written if absent so the user can customize.
-    const settings = join(home, '.claude', 'settings.json')
-    if (!(await exists(settings))) {
-      await writeFile(settings, JSON.stringify({ permissions: { allow: ['Bash'] } }, null, 2), 'utf8')
+    await atomicAgentWrite(join(home, 'CLAUDE.md'), PERSONA_HEADER(persona))
+    // Legacy settings for unsandboxed compatibility mode. Restricted mode
+    // ignores project settings and receives its narrow inline policy instead.
+    if (allowUnsandboxedByoa()) {
+      const settings = join(home, '.claude', 'settings.json')
+      if (!(await exists(settings))) {
+        await atomicAgentWrite(settings, JSON.stringify({ permissions: { allow: ['Bash'] } }, null, 2))
+      }
     }
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
     // -p: headless print mode. stream-json + verbose gives line-delimited
-    // events the daemon can log. --dangerously-skip-permissions: the home is
-    // isolated and user-owned, so non-interactive tool use is intended.
+    // events the daemon can log. Secure mode injects a fail-closed policy;
+    // the dangerous bypass remains only for explicit compatibility mode.
     // Big-brain model → --model; small-brain → ANTHROPIC_SMALL_FAST_MODEL env.
-    const flags = extraArgs('CUMORA_CLAUDE_ARGS')
+    const flags = unsafeEngineArgs('CUMORA_CLAUDE_ARGS')
     const model = args.model ? ['--model', args.model] : []
     // Continuous context across wakes: resume the agent's prior session so it
     // remembers the running task (its place in a counting relay, what it already
@@ -1042,7 +1501,9 @@ class ClaudeAdapter implements EngineAdapter {
     // unchanged (prompt in argv).
     const base = flags.length
       ? [...flags, ...resume, '-p']
-      : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
+      : allowUnsandboxedByoa()
+        ? ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
+        : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', ...claudeSecureFlags(args.home, args.env)]
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     // BYOA turns are short reactive cycles (read inbox, maybe reply). Extended
     // thinking just adds latency + cost here, and in a group @all it makes the
@@ -1052,6 +1513,9 @@ class ClaudeAdapter implements EngineAdapter {
     const env: NodeJS.ProcessEnv = {
       ...args.env,
       MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0',
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa()
+        ? args.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+        : '1',
     }
     if (args.fastModel) env.ANTHROPIC_SMALL_FAST_MODEL = args.fastModel
     return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
@@ -1060,7 +1524,7 @@ class ClaudeAdapter implements EngineAdapter {
   startSession(args: EngineSessionArgs): EngineSession | null {
     // Respect a user's custom flag override (CUMORA_CLAUDE_ARGS) by NOT using the
     // persistent path — those flags are tuned for the one-shot run; fall back to run().
-    if (extraArgs('CUMORA_CLAUDE_ARGS').length) return null
+    if (unsafeEngineArgs('CUMORA_CLAUDE_ARGS').length) return null
     const model = args.model ? ['--model', args.model] : []
     // --resume only on the FIRST spawn / after a restart, to continue a prior
     // session; inside a live process the session continues on its own.
@@ -1072,14 +1536,25 @@ class ClaudeAdapter implements EngineAdapter {
     let carriesStanding = false
     if (args.standingPrompt) {
       const file = join(args.home, '.cumora-standing-prompt.md')
-      try { writeFileSync(file, args.standingPrompt, { mode: 0o600 }); sys = ['--append-system-prompt-file', file]; carriesStanding = true }
+      try { atomicAgentWriteSync(file, args.standingPrompt); sys = ['--append-system-prompt-file', file]; carriesStanding = true }
       catch { /* couldn't write → leave it; the daemon inlines the standing prompt instead */ }
     }
-    const argv = [
-      '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-      ...resume, ...sys, ...model, '--dangerously-skip-permissions',
-    ]
-    const env: NodeJS.ProcessEnv = { ...args.env, MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0' }
+    const argv = allowUnsandboxedByoa()
+      ? [
+          '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+          ...resume, ...sys, ...model, '--dangerously-skip-permissions',
+        ]
+      : [
+          '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+          ...resume, ...sys, ...model, ...claudeSecureFlags(args.home, args.env),
+        ]
+    const env: NodeJS.ProcessEnv = {
+      ...args.env,
+      MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0',
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa()
+        ? args.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+        : '1',
+    }
     if (args.fastModel) env.ANTHROPIC_SMALL_FAST_MODEL = args.fastModel
     return new ClaudeSession(this.bin, argv, { ...args, env }, carriesStanding)
   }
@@ -1104,6 +1579,75 @@ type CodexRpcMsg = {
   result?: { thread?: { id?: unknown }; turn?: { id?: unknown }; turnId?: unknown }
   error?: { message?: unknown }
   params?: Record<string, unknown>
+}
+
+const CODEX_SECURE_CONFIG_ARGS = [
+  '--strict-config',
+  '-c', 'default_permissions="cumora"',
+  '-c', 'permissions.cumora.network.enabled=false',
+  '-c', 'shell_environment_policy.inherit="none"',
+  '-c', 'shell_environment_policy.ignore_default_excludes=false',
+]
+
+function codexThreadSecurityParams(): Record<string, unknown> {
+  return allowUnsandboxedByoa()
+    ? { approvalPolicy: 'never', sandbox: 'danger-full-access' }
+    : { approvalPolicy: 'never', sandbox: 'workspace-write' }
+}
+
+function tomlString(value: string): string {
+  return JSON.stringify(value)
+}
+
+/** The Codex core keeps its auth environment, while every model-spawned
+ * command receives only this explicit, non-secret environment. */
+function codexToolEnvironmentArgs(args: { home: string; env: NodeJS.ProcessEnv }): string[] {
+  const entries: string[] = []
+  const add = (name: string, value: string | undefined) => {
+    if (value !== undefined) entries.push(`${name}=${tomlString(value)}`)
+  }
+  add('PATH', args.env.PATH)
+  add('HOME', args.home)
+  add('USER', args.env.USER)
+  add('LOGNAME', args.env.LOGNAME)
+  add('SHELL', args.env.SHELL)
+  add('LANG', args.env.LANG)
+  add('TERM', args.env.TERM)
+  add('CUMORA_AGENT_IPC_DIR', args.env.CUMORA_AGENT_IPC_DIR)
+  add('CUMORA_AGENT_ID', args.env.CUMORA_AGENT_ID)
+  return ['-c', `shell_environment_policy.set={${entries.join(',')}}`]
+}
+
+function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
+  const workspaceAccess = readOnly ? 'read' : 'write'
+  const filesystemEntries = [
+    '":minimal"="read"',
+    `":workspace_roots"={"."="${workspaceAccess}"}`,
+  ]
+  const filesystem = `permissions.cumora.filesystem={${filesystemEntries.join(',')}}`
+  const secureArgs = [
+    ...CODEX_SECURE_CONFIG_ARGS,
+    '-c', filesystem,
+    '-c', 'web_search="disabled"',
+    '-c', 'features.hooks=false',
+    '-c', 'features.apps=false',
+    '-c', 'features.remote_plugin=false',
+    '-c', 'features.multi_agent=false',
+    '-c', 'features.shell_snapshot=false',
+    // Untrusted projects skip project-local config, hooks, and rules. This is a
+    // CLI override (highest precedence), so a model cannot plant a more
+    // privileged .codex layer for the next one-shot wake.
+    '-c', `projects.${tomlString(args.home)}.trust_level="untrusted"`,
+    ...codexToolEnvironmentArgs(args),
+  ]
+  if (!readOnly) {
+    const mcpShim = args.env.CUMORA_AGENT_MCP_SHIM
+    const ipcDir = args.env.CUMORA_AGENT_IPC_DIR
+    if (!mcpShim || !ipcDir) throw new Error('secure Cumora MCP bridge is not configured')
+    const mcp = `mcp_servers.cumora={command=${tomlString(process.execPath)},args=[${tomlString(mcpShim)}],env={CUMORA_AGENT_IPC_DIR=${tomlString(ipcDir)}},required=true,enabled_tools=["cli"],default_tools_approval_mode="approve"}`
+    secureArgs.push('-c', mcp)
+  }
+  return [...secureArgs, '-a', 'never', 'exec', '--ignore-user-config', '--ignore-rules']
 }
 
 /** A persistent Codex session over the app-server JSON-RPC protocol
@@ -1153,7 +1697,11 @@ class CodexSession implements EngineSession {
     this.carriesStandingPrompt = !!opts.standingPrompt
     // experimentalRawEvents → Codex emits payload-free `rawResponseItem/*` pings we
     // use as a liveness signal; we suppress them from the log below.
-    const params: Record<string, unknown> = { cwd: home, approvalPolicy: 'never', sandbox: 'danger-full-access', experimentalRawEvents: true }
+    const params: Record<string, unknown> = {
+      cwd: home,
+      ...codexThreadSecurityParams(),
+      experimentalRawEvents: true,
+    }
     if (opts.standingPrompt) params.developerInstructions = opts.standingPrompt
     if (opts.model) params.model = opts.model
     this.baseThreadParams = params
@@ -1161,7 +1709,7 @@ class CodexSession implements EngineSession {
     this.threadReq = opts.resumeSessionId
       ? { method: 'thread/resume', params: { threadId: opts.resumeSessionId, ...params } }
       : { method: 'thread/start', params }
-    this.child = spawn(bin, spawnArgs, { cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
+    this.child = spawnEngineChild(bin, spawnArgs, { cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => { for (const raw of b.toString('utf8').split('\n')) { const l = cleanLine(raw); if (l) this.onLog(l) } })
     this.child.on('error', (err) => this.die(1, err.message))
@@ -1191,10 +1739,10 @@ class CodexSession implements EngineSession {
       params: { threadId: this.threadId, expectedTurnId: this.activeTurnId, input: [{ type: 'text', text: stripLoneSurrogates(text) }] } }) + '\n')
   }
 
-  stop(): void {
+  stop(options: { force?: boolean } = {}): Promise<void> {
     this.exited = true
     try { this.child.stdin?.end() } catch { /* ignore */ }
-    try { this.child.kill('SIGTERM') } catch { /* ignore */ }
+    return terminateEngineTree(this.child, options.force)
   }
 
   private nextId(): number { this.reqId += 1; return this.reqId }
@@ -1393,12 +1941,14 @@ class CodexAdapter implements EngineAdapter {
     // support tier — so that's the local cerebellum here. Cheap model, no big
     // brain, no cloud. Override with CUMORA_TRIAGE_MODEL if your codex auth has
     // a different small model.
-    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    const flags = allowUnsandboxedByoa() ? extraArgs('CUMORA_TRIAGE_ARGS') : []
     const model = ['--model', args.model || 'gpt-5.4-mini']
     const { command, shell } = resolveSpawn(this.bin)
     const argv = flags.length
       ? ['exec', ...flags, '-']
-      : ['exec', ...model, '--skip-git-repo-check', '-']
+      : allowUnsandboxedByoa()
+        ? ['exec', ...model, '--skip-git-repo-check', '-']
+        : [...codexSecureExecArgs({ home: args.cwd, env: args.env }, true), ...model, '--skip-git-repo-check', '-']
     return spawnCapture(command, argv, {
       cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
       stdinText: args.prompt,
@@ -1411,7 +1961,9 @@ class CodexAdapter implements EngineAdapter {
     // for a tool-free one-token reply.
     const model = args.tier === 'small' ? ['--model', triageModel('gpt-5.4-mini')] : []
     const { command, shell } = resolveSpawn(this.bin)
-    const argv = ['exec', ...model, '--skip-git-repo-check', '-']
+    const argv = allowUnsandboxedByoa()
+      ? ['exec', ...model, '--skip-git-repo-check', '-']
+      : [...codexSecureExecArgs({ home: args.cwd, env: args.env }, true), ...model, '--skip-git-repo-check', '-']
     return spawnCapture(command, argv, {
       cwd: args.cwd, env: args.env, signal: args.signal, shell, stdinText: DOCTOR_PROMPT,
     })
@@ -1422,7 +1974,8 @@ class CodexAdapter implements EngineAdapter {
     // any of these is true, the wake path collapses to `codex exec ...` which
     // probe() already covers — running the JSON-RPC probe would just add a false
     // signal. Mark skipped and let doctor hide the line.
-    if (extraArgs('CUMORA_CODEX_ARGS').length
+    if (!allowUnsandboxedByoa()
+        || unsafeEngineArgs('CUMORA_CODEX_ARGS').length
         || process.env.CUMORA_CODEX_NO_APP_SERVER === '1'
         || IS_WIN) {
       return Promise.resolve({ ok: true, detail: '', skipped: true })
@@ -1444,10 +1997,10 @@ class CodexAdapter implements EngineAdapter {
         if (settled) return
         settled = true
         try { child.stdin?.end() } catch { /* ignore */ }
-        try { child.kill('SIGTERM') } catch { /* ignore */ }
-        resolve(r)
+        void terminateEngineTree(child).then(() => resolve(r))
       }
-      const child = spawn(command, ['app-server', '--listen', 'stdio://'], {
+      const appServerArgs = ['app-server', '--listen', 'stdio://']
+      const child = spawnEngineChild(command, appServerArgs, {
         cwd: args.cwd, env: args.env, stdio: ['pipe', 'pipe', 'pipe'], shell,
       })
       const onAbort = () => finish({ ok: false, detail: 'aborted (timeout)' })
@@ -1489,7 +2042,7 @@ class CodexAdapter implements EngineAdapter {
             // params shape CodexSession uses — so a field-name break shows up.
             writeRpc({ jsonrpc: '2.0', method: 'initialized', params: {} })
             writeRpc({ jsonrpc: '2.0', id: threadId, method: 'thread/start',
-              params: { cwd: args.cwd, approvalPolicy: 'never', sandbox: 'danger-full-access', experimentalRawEvents: true } })
+              params: { cwd: args.cwd, ...codexThreadSecurityParams(), experimentalRawEvents: true } })
             continue
           }
           if (initialized && !threadAcked && msg.id === threadId && msg.result) {
@@ -1516,30 +2069,34 @@ class CodexAdapter implements EngineAdapter {
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
     // See ClaudeAdapter.seedHome: system-owned, safe to overwrite every start.
-    await writeFile(join(home, 'AGENTS.md'), PERSONA_HEADER(persona), 'utf8')
+    await atomicAgentWrite(join(home, 'AGENTS.md'), PERSONA_HEADER(persona))
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
-    // `codex exec` is the non-interactive mode. The agent runs on the user's
-    // own paired machine and needs full access to run the cumora shim (network),
-    // clone repos, and write files — the Codex equivalent of Claude's
-    // --dangerously-skip-permissions is --dangerously-bypass-approvals-and-sandbox.
-    // --skip-git-repo-check lets it run in the agent home (not a git repo).
-    // Override the whole flag set via CUMORA_CODEX_ARGS if your version differs.
-    const flags = extraArgs('CUMORA_CODEX_ARGS')
+    // `codex exec` is the non-interactive mode. Secure mode applies a custom
+    // filesystem/network/environment profile and reaches Cumora only through
+    // local IPC. Historical full-access flags and argv overrides remain
+    // available exclusively behind the explicit compatibility opt-in.
+    const flags = unsafeEngineArgs('CUMORA_CODEX_ARGS')
     const base = flags.length
-      ? flags
-      : ['--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
+      ? ['exec', ...flags]
+      : allowUnsandboxedByoa()
+        ? ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
+        : [...codexSecureExecArgs(args), '--skip-git-repo-check']
     const model = args.model ? ['--model', args.model] : []
     const { command, shell } = resolveSpawn(this.bin)
-    return spawnEngine(command, ['exec', ...model, ...base, '-'], args, { shell, stdinText: args.prompt })
+    return spawnEngine(command, [...base, ...model, '-'], args, { shell, stdinText: args.prompt })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
     // Escape hatches → fall back to one-shot `codex exec` (run()): a custom-args
     // override, an explicit opt-out, or Windows (JSON-RPC over a .cmd shell is
     // fragile; exec is the safe path there).
-    if (extraArgs('CUMORA_CODEX_ARGS').length) return null
+    // app-server currently has no equivalent to exec --ignore-user-config, so
+    // user MCP/hook/config layers cannot be excluded. Keep the secure default
+    // on the one-shot path; persistent compatibility is an explicit opt-in.
+    if (!allowUnsandboxedByoa()) return null
+    if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length) return null
     if (process.env.CUMORA_CODEX_NO_APP_SERVER === '1') return null
     if (IS_WIN) return null
     try { ensureGitRepoForCodex(args.home) }
@@ -1613,7 +2170,7 @@ class GrokSession implements EngineSession {
     this.sessionNewParams = { cwd: home, mcpServers: [], _meta: meta }
     this.sessionWasLoad = !!opts.resumeSessionId
     const grokEnv: NodeJS.ProcessEnv = { ...env, GROK_DISABLE_AUTOUPDATER: env.GROK_DISABLE_AUTOUPDATER ?? '1' }
-    this.child = spawn(bin, spawnArgs, { cwd: home, env: grokEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
+    this.child = spawnEngineChild(bin, spawnArgs, { cwd: home, env: grokEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => {
       for (const raw of b.toString('utf8').split('\n')) {
@@ -1654,10 +2211,10 @@ class GrokSession implements EngineSession {
     }
   }
 
-  stop(): void {
+  stop(options: { force?: boolean } = {}): Promise<void> {
     this.exited = true
     try { this.child.stdin?.end() } catch { /* ignore */ }
-    try { this.child.kill('SIGTERM') } catch { /* ignore */ }
+    return terminateEngineTree(this.child, options.force)
   }
 
   private nextId(): number { this.reqId += 1; return this.reqId }
@@ -1880,10 +2437,9 @@ class GrokAdapter implements EngineAdapter {
         if (settled) return
         settled = true
         try { child.stdin?.end() } catch { /* ignore */ }
-        try { child.kill('SIGTERM') } catch { /* ignore */ }
-        resolve(r)
+        void terminateEngineTree(child).then(() => resolve(r))
       }
-      const child = spawn(command, ['agent', '--always-approve', '--no-leader', 'stdio'], {
+      const child = spawnEngineChild(command, ['agent', '--always-approve', '--no-leader', 'stdio'], {
         cwd: args.cwd,
         env: { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -2141,7 +2697,7 @@ function spawnCursorStream(
 ): Promise<EngineRunResult & { text: string }> {
   return new Promise((resolve) => {
     const tracker = new CursorTurnTracker(opts.pin ?? null, opts.onHopUsage)
-    const child = spawn(command, args, {
+    const child = spawnEngineChild(command, args, {
       cwd: opts.cwd, env: opts.env,
       stdio: [opts.stdinText != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       shell: opts.shell,
@@ -2149,9 +2705,7 @@ function spawnCursorStream(
     if (opts.stdinText != null) {
       writeStdin(child, opts.stdinText, { end: true })
     }
-    const onAbort = (): void => { child.kill('SIGTERM') }
-    opts.signal.addEventListener('abort', onAbort, { once: true })
-    if (opts.signal.aborted) onAbort()
+    const abort = bindAbortTermination(child, opts.signal)
     const stderrTail: string[] = []
     const stdoutTail: string[] = []
     const decoder: Record<'stdout' | 'stderr', StringDecoder> = {
@@ -2181,27 +2735,31 @@ function spawnCursorStream(
     child.on('error', (err) => {
       if (settled) return
       settled = true
-      opts.signal.removeEventListener('abort', onAbort)
-      resolve({ exitCode: 1, error: err instanceof Error ? err.message : String(err), sessionId: null, text: '' })
+      abort.dispose()
+      void abort.wait().then(() => {
+        resolve({ exitCode: 1, error: err instanceof Error ? err.message : String(err), sessionId: null, text: '' })
+      })
     })
     child.on('close', (code, signalName) => {
       if (settled) return
       settled = true
-      opts.signal.removeEventListener('abort', onAbort)
-      pump('stdout', null)
-      pump('stderr', null)
-      const procExit = code ?? (signalName ? 128 : 1)
-      // The stream is the truth: is_error:true fails the turn even on exit 0.
-      const streamError = tracker.error
-        ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}`
-        : (opts.requireResult && !tracker.sawResult
-          ? 'engine stream ended without a result event (cursor-agent exited early)'
-          : null)
-      const exitCode = procExit !== 0 ? procExit : (streamError ? 1 : 0)
-      const error = procExit !== 0
-        ? failurePreview({ exitCode: procExit, signalName, stderr: stderrTail, stdout: stdoutTail })
-        : streamError ?? undefined
-      resolve({ exitCode, error, sessionId: tracker.sessionId, usage: tracker.usage, model: tracker.model, text: tracker.text })
+      abort.dispose()
+      void abort.wait().then(() => {
+        pump('stdout', null)
+        pump('stderr', null)
+        const procExit = code ?? (signalName ? 128 : 1)
+        // The stream is the truth: is_error:true fails the turn even on exit 0.
+        const streamError = tracker.error
+          ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}`
+          : (opts.requireResult && !tracker.sawResult
+            ? 'engine stream ended without a result event (cursor-agent exited early)'
+            : null)
+        const exitCode = procExit !== 0 ? procExit : (streamError ? 1 : 0)
+        const error = procExit !== 0
+          ? failurePreview({ exitCode: procExit, signalName, stderr: stderrTail, stdout: stdoutTail })
+          : streamError ?? undefined
+        resolve({ exitCode, error, sessionId: tracker.sessionId, usage: tracker.usage, model: tracker.model, text: tracker.text })
+      })
     })
   })
 }
@@ -2211,7 +2769,7 @@ class CursorAdapter implements EngineAdapter {
   readonly bin = 'cursor-agent'
 
   /** A turn: full-tools one-shot (`--force` auto-approves the agent's tool use
-   *  inside its isolated, user-owned home — the Cursor analogue of Claude's
+   *  inside its dedicated, user-owned home — the Cursor analogue of Claude's
    *  --dangerously-skip-permissions), `--trust` skips the workspace-trust
    *  prompt a headless spawn can't answer. The prompt is the LAST argv element
    *  (Cursor takes it positionally); on Windows it travels via stdin instead. */
@@ -2927,7 +3485,7 @@ function spawnPiJson(
   }
   return new Promise((resolve) => {
     const tracker = new PiTurnTracker(opts.onHopUsage)
-    const child = spawn(command, args, {
+    const child = spawnEngineChild(command, args, {
       cwd: opts.cwd, env: opts.env,
       stdio: [opts.stdinText != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       shell: opts.shell,
@@ -2935,16 +3493,13 @@ function spawnPiJson(
     if (opts.stdinText != null) {
       writeStdin(child, opts.stdinText, { end: true })
     }
-    const onAbort = (): void => { child.kill('SIGTERM') }
-    opts.signal.addEventListener('abort', onAbort, { once: true })
-    // Close the small race between the pre-spawn check above and listener
-    // registration. AbortSignal does not replay an earlier abort event.
-    if (opts.signal.aborted) onAbort()
+    const abort = bindAbortTermination(child, opts.signal)
     // StringDecoder + carried partial line, for the same reason spawnEngine has
     // them: a pipe read chops a long event (a big message_end) at an arbitrary
     // byte offset, and a naive per-chunk split would hand JSON.parse two halves.
     const decoder = new StringDecoder('utf8')
     let carry = ''
+    let settled = false
     const stderrTail: string[] = []
     const stdoutTail: string[] = []
     const takeLine = (raw: string): void => {
@@ -2974,18 +3529,26 @@ function spawnPiJson(
       }
     })
     child.on('error', (err) => {
-      opts.signal.removeEventListener('abort', onAbort)
-      resolve({ exitCode: 1, error: err instanceof Error ? err.message : String(err), sessionId: null, text: '' })
+      if (settled) return
+      settled = true
+      abort.dispose()
+      void abort.wait().then(() => {
+        resolve({ exitCode: 1, error: err instanceof Error ? err.message : String(err), sessionId: null, text: '' })
+      })
     })
     child.on('close', (code, signalName) => {
-      opts.signal.removeEventListener('abort', onAbort)
-      pump(null) // flush a final line without a trailing newline
-      const procExit = code ?? (signalName ? 128 : 1)
-      const exitCode = procExit !== 0 ? procExit : (tracker.error ? 1 : 0)
-      const error = procExit !== 0
-        ? failurePreview({ exitCode: procExit, signalName, stderr: stderrTail, stdout: stdoutTail })
-        : (tracker.error ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}` : undefined)
-      resolve({ exitCode, error, sessionId: tracker.sessionId, usage: tracker.usage, model: tracker.model, text: tracker.text })
+      if (settled) return
+      settled = true
+      abort.dispose()
+      void abort.wait().then(() => {
+        pump(null) // flush a final line without a trailing newline
+        const procExit = code ?? (signalName ? 128 : 1)
+        const exitCode = procExit !== 0 ? procExit : (tracker.error ? 1 : 0)
+        const error = procExit !== 0
+          ? failurePreview({ exitCode: procExit, signalName, stderr: stderrTail, stdout: stdoutTail })
+          : (tracker.error ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}` : undefined)
+        resolve({ exitCode, error, sessionId: tracker.sessionId, usage: tracker.usage, model: tracker.model, text: tracker.text })
+      })
     })
   })
 }
@@ -3008,7 +3571,7 @@ class PiSession implements EngineSession {
   private stderrTail: string[] = []
   private stdoutTail: string[] = []
   private pendingTimer: ReturnType<typeof setTimeout> | null = null
-  private stopTimer: ReturnType<typeof setTimeout> | null = null
+  private stopPromise: Promise<void> | null = null
   readonly carriesStandingPrompt: boolean
 
   constructor(bin: string, args: string[], opts: EngineSessionArgs, sessionId: string, carriesStandingPrompt: boolean) {
@@ -3019,7 +3582,7 @@ class PiSession implements EngineSession {
     // Cross-platform spawn (Windows: `pi.cmd` via the shell). Everything travels
     // over stdin as JSON here, so there are no argv-quoting concerns.
     const { command, shell } = resolveSpawn(bin)
-    this.child = spawn(command, args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell })
+    this.child = spawnEngineChild(command, args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => this.onStderr(b))
     this.child.on('error', (err) => this.die(1, err.message))
@@ -3071,25 +3634,19 @@ class PiSession implements EngineSession {
     if (this.pending && this.alive && text.trim()) this.write({ type: 'steer', message: stripLoneSurrogates(text) })
   }
 
-  stop(options: { force?: boolean } = {}): void {
+  stop(options: { force?: boolean } = {}): Promise<void> {
     this.exited = true
-    if (this.stopTimer) {
-      if (!options.force) return
-      clearTimeout(this.stopTimer)
-      this.stopTimer = null
-    }
     // pi exits cleanly when stdin closes (it disposes the session and returns 0),
     // so close stdin first and only SIGTERM a process that hasn't gone by itself.
     try { this.child.stdin?.end() } catch { /* ignore */ }
-    // During daemon shutdown there is no event loop left to run the delayed
-    // fallback below. Dispatch SIGTERM synchronously before process.exit(), or a
-    // Pi that does not exit on EOF can be orphaned under the supervisor.
-    if (options.force) {
-      try { this.child.kill('SIGTERM') } catch { /* ignore */ }
-      return
+    if (options.force) return terminateEngineTree(this.child, true)
+    if (!this.stopPromise) {
+      this.stopPromise = (async () => {
+        if (await waitForChildExit(this.child, 2_000)) return
+        await terminateEngineTree(this.child)
+      })()
     }
-    this.stopTimer = setTimeout(() => { try { this.child.kill('SIGTERM') } catch { /* ignore */ } }, 2000)
-    this.stopTimer.unref?.()
+    return this.stopPromise
   }
 
   private write(msg: object): boolean {
@@ -3164,7 +3721,6 @@ class PiSession implements EngineSession {
     const alreadyDown = this.exited
     this.exited = true
     this.exitCode = code
-    if (this.stopTimer) { clearTimeout(this.stopTimer); this.stopTimer = null }
     if (!alreadyDown) {
       this.onLog(`[session] engine process died ${this.pending ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
     }
@@ -3250,10 +3806,9 @@ class PiAdapter implements EngineAdapter {
         if (settled) return
         settled = true
         try { child.stdin?.end() } catch { /* ignore */ }
-        try { child.kill('SIGTERM') } catch { /* ignore */ }
-        resolve(r)
+        void terminateEngineTree(child).then(() => resolve(r))
       }
-      const child = spawn(command, ['--mode', 'rpc', ...PiAdapter.BARE], {
+      const child = spawnEngineChild(command, ['--mode', 'rpc', ...PiAdapter.BARE], {
         cwd: args.cwd, env: args.env, stdio: ['pipe', 'pipe', 'pipe'], shell,
       })
       const onAbort = (): void => finish({ ok: false, detail: 'aborted (timeout)' })
@@ -3326,7 +3881,7 @@ class PiAdapter implements EngineAdapter {
       resumeSessionId: args.resumeSessionId, onLog: args.onLog, onHopUsage: args.onHopUsage,
     })
     if (!session) return { exitCode: 1, error: 'pi session could not be started', sessionId: args.resumeSessionId ?? null }
-    const onAbort = (): void => session.stop({ force: true })
+    const onAbort = (): void => { void session.stop({ force: true }) }
     args.signal.addEventListener('abort', onAbort, { once: true })
     // The signal may have flipped after the pre-spawn check but before the
     // listener above was installed.
@@ -3361,7 +3916,7 @@ class PiAdapter implements EngineAdapter {
     let carriesStanding = false
     if (args.standingPrompt) {
       const file = join(args.home, '.cumora-standing-prompt.md')
-      try { writeFileSync(file, args.standingPrompt, { mode: 0o600 }); sys = ['--append-system-prompt', file]; carriesStanding = true }
+      try { atomicAgentWriteSync(file, args.standingPrompt); sys = ['--append-system-prompt', file]; carriesStanding = true }
       catch { /* couldn't write → leave it; the daemon inlines the standing prompt instead */ }
     }
     const argv = [

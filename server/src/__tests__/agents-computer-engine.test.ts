@@ -4,20 +4,30 @@
  * Run: node --import tsx --test server/src/__tests__/agents-computer-engine.test.ts
  */
 import assert from 'node:assert/strict'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { getAdapter, headlessSpawnOptions, resolveSpawn, type EngineHopReport, type EngineRunResult } from '../agents/computer/engine.js'
+import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
 
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
 const ORIGINAL_PATHEXT = process.env.PATHEXT
+const ORIGINAL_UNSANDBOXED = process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
 const tempDirs: string[] = []
 // Sessions spawn a child process. Track them so a FAILING assertion still tears
 // the child down — otherwise it outlives the test and the runner never exits.
-const liveSessions: Array<{ stop(): void }> = []
+const liveSessions: Array<{ stop(): void | Promise<void> }> = []
+
+function secureClaudeEnv(root: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    CUMORA_AGENT_IPC_DIR: join(root, 'private-ipc'),
+    CUMORA_AGENT_MCP_SHIM: join(root, 'trusted', 'cumora-mcp'),
+    ...overrides,
+  }
+}
 
 test('engine subprocesses always suppress Windows console windows', () => {
   assert.deepEqual(headlessSpawnOptions({ shell: true, cwd: 'C:\\agent home', windowsHide: false }), {
@@ -28,12 +38,87 @@ test('engine subprocesses always suppress Windows console windows', () => {
 })
 
 afterEach(async () => {
-  for (const s of liveSessions.splice(0)) { try { s.stop() } catch { /* already gone */ } }
+  for (const s of liveSessions.splice(0)) { try { await s.stop() } catch { /* already gone */ } }
   if (ORIGINAL_PATH === undefined) delete process.env.PATH
   else process.env.PATH = ORIGINAL_PATH
   if (ORIGINAL_PATHEXT === undefined) delete process.env.PATHEXT
   else process.env.PATHEXT = ORIGINAL_PATHEXT
+  if (ORIGINAL_UNSANDBOXED === undefined) delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+  else process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = ORIGINAL_UNSANDBOXED
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+})
+
+test('secure inventory exposes only engines with a verified boundary', () => {
+  const installed = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini'] as const
+  assert.deepEqual(runnableEngineIds(installed, {}, 'darwin'), ['claude', 'codex'])
+  assert.deepEqual(runnableEngineIds(installed, {}, 'linux'), ['claude', 'codex'])
+  assert.deepEqual(runnableEngineIds(installed, {}, 'win32'), ['codex'])
+  assert.deepEqual(
+    runnableEngineIds(installed, { CUMORA_BYOA_ALLOW_UNSANDBOXED: '1' }, 'win32'),
+    [...installed],
+  )
+})
+
+test('secure engines fail closed on old CLIs and missing Linux sandbox dependencies', () => {
+  assert.equal(secureEngineCapabilityReason('claude', '2.1.247', 'darwin'), 'version 2.1.247 is older than the secure minimum 2.1.248')
+  assert.equal(secureEngineCapabilityReason('claude', '2.1.248', 'darwin'), null)
+  assert.equal(secureEngineCapabilityReason('codex', '0.137.9', 'linux'), 'version 0.137.9 is older than the secure minimum 0.138.0')
+  assert.equal(secureEngineCapabilityReason('codex', '0.138.0', 'linux'), null)
+  assert.match(
+    secureEngineCapabilityReason('claude', '2.1.248', 'linux', { bwrap: false, socat: false }) ?? '',
+    /bubblewrap.*socat/,
+  )
+})
+
+test('secure adapters replace persona symlinks without writing their targets', {
+  skip: IS_WIN,
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-persona-symlink-'))
+  tempDirs.push(root)
+  const outside = join(root, 'outside-secret')
+  await writeFile(outside, 'do not overwrite', 'utf8')
+
+  for (const [engine, personaFile] of [['claude', 'CLAUDE.md'], ['codex', 'AGENTS.md']] as const) {
+    const home = join(root, engine)
+    await mkdir(home)
+    await symlink(outside, join(home, personaFile))
+    await getAdapter(engine).seedHome(home, {
+      id: engine,
+      name: `Secure ${engine}`,
+      role: 'Tester',
+      systemPrompt: null,
+    })
+    assert.equal(await readFile(outside, 'utf8'), 'do not overwrite')
+    assert.equal((await lstat(join(home, personaFile))).isSymbolicLink(), false)
+    assert.match(await readFile(join(home, personaFile), 'utf8'), new RegExp(`Secure ${engine}`))
+  }
+})
+
+test('secure adapters reject linked state directories', {
+  skip: IS_WIN,
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-state-symlink-'))
+  tempDirs.push(root)
+  const home = join(root, 'home')
+  const outside = join(root, 'outside')
+  await mkdir(home)
+  await mkdir(outside)
+  await symlink(outside, join(home, 'memory'))
+
+  await assert.rejects(
+    getAdapter('codex').seedHome(home, { id: 'codex', name: 'Codex', role: null, systemPrompt: null }),
+    /refuses non-directory or linked path/,
+  )
+
+  await rm(join(home, 'memory'))
+  await mkdir(join(home, 'memory'))
+  const outsideFile = join(root, 'outside-file')
+  await writeFile(outsideFile, 'do not read as memory', 'utf8')
+  await symlink(outsideFile, join(home, 'memory', 'MEMORY.md'))
+  await assert.rejects(
+    getAdapter('codex').seedHome(home, { id: 'codex', name: 'Codex', role: null, systemPrompt: null }),
+    /refuses non-file or linked memory index/,
+  )
 })
 
 test('local engine failure returns stderr tail for observability', async () => {
@@ -57,7 +142,7 @@ test('local engine failure returns stderr tail for observability', async () => {
   const result = await getAdapter('claude').run({
     home,
     prompt: 'wake',
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: secureClaudeEnv(root, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
     model: null,
     fastModel: null,
     onLog: (line) => logs.push(line),
@@ -67,6 +152,74 @@ test('local engine failure returns stderr tail for observability', async () => {
   assert.equal(result.exitCode, 1)
   assert.match(result.error ?? '', /usage limit reached, no tokens left/i)
   assert.deepEqual(logs, ['Claude Code error: usage limit reached, no tokens left'])
+})
+
+test('Claude secure mode is fail-closed and strips tool credentials', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-secure-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir)
+  await mkdir(home)
+  const capture = join(binDir, 'capture.js')
+  await writeFile(
+    capture,
+    "process.stderr.write(JSON.stringify({ argv: process.argv.slice(2), scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB }))\nprocess.exit(1)\n",
+    'utf8',
+  )
+  const launcher = join(binDir, 'claude')
+  await writeFile(launcher, '#!/bin/sh\nexec node "$(dirname "$0")/capture.js" "$@"\n', 'utf8')
+  await chmod(launcher, 0o755)
+
+  const logs: string[] = []
+  const mcpShim = join(root, 'trusted', 'cumora-mcp')
+  await getAdapter('claude').run({
+    home,
+    prompt: 'wake',
+    env: secureClaudeEnv(root, {
+      PATH: `${binDir}:${process.env.PATH ?? ''}`,
+      OPENAI_API_KEY: 'must-not-appear-in-settings',
+    }),
+    onLog: (line) => logs.push(line),
+    signal: new AbortController().signal,
+  })
+
+  const captured = JSON.parse(logs[0] ?? '{}') as { argv?: string[]; scrub?: string }
+  assert.equal(captured.scrub, '1')
+  assert.ok(captured.argv?.includes('--restricted'))
+  assert.ok(captured.argv?.includes('dontAsk'))
+  assert.ok(captured.argv?.includes('Read,Write,Edit,Glob,Grep,mcp__cumora__cli'))
+  assert.equal(captured.argv?.some((arg) => /Bash\(cumora/.test(arg)), false)
+  assert.equal(captured.argv?.some((arg) => arg.includes('dangerously-skip-permissions')), false)
+  const mcpIndex = captured.argv?.indexOf('--mcp-config') ?? -1
+  assert.ok(mcpIndex >= 0)
+  const mcpConfig = JSON.parse(captured.argv?.[mcpIndex + 1] ?? '{}') as {
+    mcpServers?: { cumora?: { command?: string; args?: string[]; env?: Record<string, string> } }
+  }
+  assert.equal(mcpConfig.mcpServers?.cumora?.command, process.execPath)
+  assert.deepEqual(mcpConfig.mcpServers?.cumora?.args, [mcpShim])
+  const settingsIndex = captured.argv?.indexOf('--settings') ?? -1
+  assert.ok(settingsIndex >= 0)
+  const settingsText = captured.argv?.[settingsIndex + 1] ?? '{}'
+  const settings = JSON.parse(settingsText) as {
+    permissions?: { allow?: string[]; deny?: string[] }
+    sandbox?: {
+      failIfUnavailable?: boolean
+      allowUnsandboxedCommands?: boolean
+      filesystem?: { denyRead?: string[]; allowRead?: string[] }
+      credentials?: { envVars?: Array<{ name?: string; mode?: string }> }
+    }
+  }
+  assert.ok(settings.permissions?.allow?.includes('Read(/**)'))
+  assert.ok(settings.permissions?.allow?.includes('Edit(/**)'))
+  assert.ok(settings.permissions?.deny?.includes('Read(/bin/**)'))
+  assert.ok(settings.permissions?.deny?.includes('Edit(/bin/**)'))
+  assert.equal(settings.sandbox?.failIfUnavailable, true)
+  assert.equal(settings.sandbox?.allowUnsandboxedCommands, false)
+  assert.ok(settings.sandbox?.filesystem?.denyRead?.includes(process.platform === 'darwin' ? '/Users' : '/home'))
+  assert.ok(settings.sandbox?.filesystem?.allowRead?.includes(home))
+  assert.ok(settings.sandbox?.credentials?.envVars?.some((entry) => entry.name === 'OPENAI_API_KEY' && entry.mode === 'deny'))
+  assert.doesNotMatch(settingsText, /must-not-appear-in-settings/)
 })
 
 test('persistent Claude startup failure keeps stderr for first send', async () => {
@@ -89,7 +242,7 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   const logs: string[] = []
   const session = getAdapter('claude').startSession?.({
     home,
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: secureClaudeEnv(root, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
     model: null,
     fastModel: null,
     onLog: (line) => logs.push(line),
@@ -135,7 +288,7 @@ test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', asyn
   const result = await adapter.run({
     home,
     prompt: 'wake',
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: secureClaudeEnv(root, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
     model: null,
     fastModel: null,
     onLog: () => { /* unused */ },
@@ -216,12 +369,18 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   process.env.PATH = `${binDir}${delimiter}${ORIGINAL_PATH ?? ''}`
 
   const adapter = getAdapter('codex')
+  const mcpShim = join(root, 'trusted', 'cumora-mcp')
   const longPrompt = `line one with spaces & shell characters\n${'x'.repeat(12_000)}`
   const logs: string[] = []
   const run = await adapter.run({
     home,
     prompt: longPrompt,
-    env: { ...process.env },
+    env: {
+      ...process.env,
+      OPENAI_API_KEY: 'must-not-reach-tools',
+      CUMORA_AGENT_IPC_DIR: join(root, 'private-ipc'),
+      CUMORA_AGENT_MCP_SHIM: mcpShim,
+    },
     model: 'test-model',
     fastModel: null,
     onLog: (line) => logs.push(line),
@@ -229,10 +388,31 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   })
   assert.equal(run.exitCode, 0)
   const runCapture = JSON.parse(logs.at(-1) ?? '{}') as { argv?: string[]; stdin?: string }
-  assert.deepEqual(runCapture.argv, [
-    'exec', '--model', 'test-model',
-    '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-',
-  ])
+  assert.ok(runCapture.argv?.includes('default_permissions="cumora"'))
+  assert.ok(runCapture.argv?.includes('permissions.cumora.network.enabled=false'))
+  assert.ok(runCapture.argv?.includes('shell_environment_policy.inherit="none"'))
+  assert.equal(runCapture.argv?.some((arg) => arg.includes(`${join(root, 'private-ipc', 'requests')}"="write`)), false)
+  assert.equal(runCapture.argv?.some((arg) => arg.includes(`${join(root, 'private-ipc', 'responses')}"="write`)), false)
+  assert.ok(runCapture.argv?.includes('web_search="disabled"'))
+  assert.ok(runCapture.argv?.includes('features.hooks=false'))
+  assert.ok(runCapture.argv?.includes(`projects.${JSON.stringify(home)}.trust_level="untrusted"`))
+  assert.ok(runCapture.argv?.some((arg) =>
+    arg.startsWith('mcp_servers.cumora={')
+      && arg.includes(`command=${JSON.stringify(process.execPath)}`)
+      && arg.includes(`args=[${JSON.stringify(mcpShim)}]`)
+      && arg.includes(`CUMORA_AGENT_IPC_DIR=${JSON.stringify(join(root, 'private-ipc'))}`)
+      && arg.includes('enabled_tools=["cli"]')
+      && arg.includes('required=true'),
+  ))
+  assert.ok(runCapture.argv?.includes('exec'))
+  assert.ok(runCapture.argv?.includes('--ignore-user-config'))
+  assert.ok(runCapture.argv?.includes('--ignore-rules'))
+  assert.ok(runCapture.argv?.includes('--model'))
+  assert.ok(runCapture.argv?.includes('test-model'))
+  assert.ok(runCapture.argv?.includes('--skip-git-repo-check'))
+  assert.equal(runCapture.argv?.at(-1), '-')
+  assert.equal(runCapture.argv?.some((arg) => arg.includes('dangerously')), false)
+  assert.equal(runCapture.argv?.some((arg) => arg.includes('must-not-reach-tools')), false)
   assert.equal(runCapture.stdin, longPrompt)
 
   const triagePrompt = 'triage prompt with spaces\nand a second line'
@@ -244,9 +424,11 @@ test('Codex one-shot paths send prompts through stdin', async () => {
     signal: new AbortController().signal,
   })
   const triageCapture = JSON.parse(triage.text) as { argv?: string[]; stdin?: string }
-  assert.deepEqual(triageCapture.argv, [
-    'exec', '--model', 'triage-model', '--skip-git-repo-check', '-',
-  ])
+  assert.ok(triageCapture.argv?.includes('permissions.cumora.filesystem={":minimal"="read",":workspace_roots"={"."="read"}}'))
+  assert.equal(triageCapture.argv?.some((arg) => arg.startsWith('mcp_servers.cumora=')), false)
+  assert.ok(triageCapture.argv?.includes('--ignore-user-config'))
+  assert.ok(triageCapture.argv?.includes('triage-model'))
+  assert.equal(triageCapture.argv?.at(-1), '-')
   assert.equal(triageCapture.stdin, triagePrompt)
 
   const probe = await adapter.probe({
@@ -256,7 +438,9 @@ test('Codex one-shot paths send prompts through stdin', async () => {
     signal: new AbortController().signal,
   })
   const probeCapture = JSON.parse(probe.text) as { argv?: string[]; stdin?: string }
-  assert.deepEqual(probeCapture.argv, ['exec', '--skip-git-repo-check', '-'])
+  assert.ok(probeCapture.argv?.includes('permissions.cumora.network.enabled=false'))
+  assert.ok(probeCapture.argv?.includes('--ignore-user-config'))
+  assert.equal(probeCapture.argv?.at(-1), '-')
   assert.equal(probeCapture.stdin, 'Connectivity check. Reply with exactly: OK')
 })
 
@@ -303,6 +487,7 @@ async function fakeCodexRejectingThread(root: string): Promise<string> {
 }
 
 async function startFakeCodexSession(opts: { resume?: string } = {}) {
+  process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-'))
   tempDirs.push(root)
   const home = join(root, 'home')
@@ -311,7 +496,7 @@ async function startFakeCodexSession(opts: { resume?: string } = {}) {
   const logs: string[] = []
   const session = getAdapter('codex').startSession!({
     home,
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: secureClaudeEnv(root, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
     resumeSessionId: opts.resume ?? null,
     onLog: (l) => logs.push(l),
   })
@@ -391,7 +576,7 @@ test('a stream-json event split across pipe chunks is still parsed', { skip: IS_
   const r = await getAdapter('claude').run({
     home,
     prompt: 'go',
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: secureClaudeEnv(dirname(home), { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
     onLog: () => {},
     onHopUsage: (h) => hops.push({ model: h.model }),
     signal: new AbortController().signal,
@@ -427,7 +612,7 @@ test('a multi-byte character split across pipe chunks is not corrupted', { skip:
   const r = await getAdapter('claude').run({
     home,
     prompt: 'go',
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: secureClaudeEnv(root, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
     onLog: () => {},
     signal: new AbortController().signal,
   })
@@ -439,8 +624,8 @@ test('a multi-byte character split across pipe chunks is not corrupted', { skip:
 // ── one-shot engine children must die with their runner ─────────────────────
 // The persistent session is torn down by AgentRunner.stop(); the one-shot child
 // was not, because its AbortSignal came from a controller nothing ever aborted.
-// An orphan keeps a valid runtime token and the `cumora` shim on PATH, so it
-// goes on posting AS the agent while the replacement runner answers the same
+// An orphan keeps the `cumora` IPC shim on PATH, so it can go on posting AS the
+// agent while the replacement runner answers the same
 // messages — with the OLD persona the operator just changed.
 
 /** A fake engine shaped like a real one: it spawns a child that INHERITS its
@@ -468,7 +653,7 @@ async function runFakeEngine(binDir: string, home: string, signal: AbortSignal) 
   return getAdapter('claude').run({
     home,
     prompt: 'go',
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: secureClaudeEnv(dirname(home), { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
     onLog: () => {},
     signal,
   })
@@ -488,7 +673,7 @@ test('an already-aborted signal kills the engine child immediately', { skip: IS_
 
   const r = await Promise.race([
     runFakeEngine(binDir, home, ac.signal),
-    delay(15_000).then(() => 'ORPHANED' as const),
+    delay(15_000, 'ORPHANED' as const, { ref: false }),
   ])
   assert.notEqual(r, 'ORPHANED', 'the child outlived its aborted signal — it would keep posting as the agent')
   assert.notEqual((r as { exitCode: number }).exitCode, 0, 'a killed turn must not report success')
@@ -505,9 +690,64 @@ test('aborting mid-run kills the engine child', { skip: IS_WIN }, async () => {
   const p = runFakeEngine(binDir, home, ac.signal)
   await delay(150)
   ac.abort()
-  const r = await Promise.race([p, delay(15_000).then(() => 'ORPHANED' as const)])
+  const r = await Promise.race([p, delay(15_000, 'ORPHANED' as const, { ref: false })])
   assert.notEqual(r, 'ORPHANED', 'abort must terminate the turn even when a grandchild holds the stdio pipes')
   assert.notEqual((r as { exitCode: number }).exitCode, 0)
+})
+
+test('aborting kills a descendant that detached into its own process group', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-abort-detached-'))
+  tempDirs.push(root)
+  const home = join(root, 'home')
+  const binDir = join(root, 'bin')
+  const pidFile = join(root, 'detached.pid')
+  await mkdir(home)
+  await mkdir(binDir)
+  const fake = join(binDir, 'claude')
+  await writeFile(
+    fake,
+    '#!/usr/bin/env node\n' +
+    "const { spawn } = require('node:child_process')\n" +
+    "const { writeFileSync } = require('node:fs')\n" +
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 120000)'], { detached: true, stdio: 'ignore' })\n" +
+    "writeFileSync(process.env.FAKE_DETACHED_PID_FILE, String(child.pid))\n" +
+    'setTimeout(() => {}, 120000)\n',
+    'utf8',
+  )
+  await chmod(fake, 0o755)
+
+  const ac = new AbortController()
+  const run = getAdapter('claude').run({
+    home,
+    prompt: 'go',
+    env: secureClaudeEnv(root, {
+      PATH: `${binDir}:${process.env.PATH ?? ''}`,
+      FAKE_DETACHED_PID_FILE: pidFile,
+    }),
+    onLog: () => {},
+    signal: ac.signal,
+  })
+  let detachedPid = 0
+  try {
+    for (let i = 0; i < 100 && detachedPid === 0; i += 1) {
+      try { detachedPid = Number((await readFile(pidFile, 'utf8')).trim()) }
+      catch { await delay(20) }
+    }
+    assert.ok(detachedPid > 0, 'fake engine must expose its detached child pid')
+    ac.abort()
+    const result = await Promise.race([run, delay(15_000, 'ORPHANED' as const, { ref: false })])
+    assert.notEqual(result, 'ORPHANED')
+
+    assert.throws(
+      () => process.kill(detachedPid, 0),
+      (err: unknown) => (err as NodeJS.ErrnoException).code === 'ESRCH',
+      'run() must not resolve until a setsid-style descendant is gone',
+    )
+  } finally {
+    if (detachedPid > 0) {
+      try { process.kill(detachedPid, 'SIGKILL') } catch { /* already gone */ }
+    }
+  }
 })
 
 test('a normal run is unaffected by the abort wiring', { skip: IS_WIN }, async () => {
@@ -523,7 +763,7 @@ test('a normal run is unaffected by the abort wiring', { skip: IS_WIN }, async (
   const r = await getAdapter('claude').run({
     home,
     prompt: 'go',
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: secureClaudeEnv(root, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
     onLog: () => {},
     signal: new AbortController().signal,
   })
