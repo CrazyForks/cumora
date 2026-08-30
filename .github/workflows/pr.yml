@@ -51,6 +51,22 @@ jobs:
       - name: Every sub2api call tracked in llm_calls
         run: node scripts/guard-llm-tracked.mjs
 
+  # An engine is either wired into all of its lists or none. The dangerous
+  # omission is BYOA_SOURCES: normalizeByoaSource() maps anything unknown to
+  # 'byoa-claude', so a half-wired engine does not error — it bills its runs to
+  # the wrong engine. Same fast-fail shape as the two guards above.
+  engine-registry-guard:
+    name: Engine registry guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Every engine wired into all of its lists
+        run: node scripts/guard-engine-registry.mjs
+
   lint:
     name: Lint (Biome)
     runs-on: ubuntu-latest
