@@ -44,8 +44,17 @@ export async function announceComputerOnline(computerId: string, companyId: stri
   await broadcastComputerStatus(computerId, companyId, 'online')
 }
 
-/** Engines a paired (non-cloud) computer is allowed to advertise. */
-const PAIRABLE_ENGINES: ReadonlySet<string> = new Set(['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini'])
+/** Engines a paired (non-cloud) computer is allowed to advertise.
+ *
+ *  Spelled as a Record over the engine union rather than a Set literal so the
+ *  COMPILER is what notices a new engine, not a reviewer: adding an id to
+ *  EngineId makes this fail to compile until the id is classified here. A
+ *  plain `new Set([...])` accepted an incomplete list silently, and the engine
+ *  left out of it could be detected and shown but never actually paired. */
+const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
+  claude: true, codex: true, grok: true, cursor: true, opencode: true, pi: true, gemini: true,
+}
+const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
 
 /** Merge a fresh PATH detection into a computer's advertised engine list.
  *
