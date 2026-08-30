@@ -12,7 +12,7 @@ import { LanguagePicker } from '@/components/LanguagePicker'
 import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
-import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINE_IDS, engineLabel } from '@/lib/engines'
+import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINES, RUNNABLE_ENGINE_IDS, engineLabel, type RunnableEngineId } from '@/lib/engines'
 import type { Computer, EngineId } from '@/types'
 
 // The tab's identity is its `key`; the label is a message key resolved at
@@ -830,7 +830,7 @@ function ComputersTab() {
   // Engine for a NEWLY added computer's starter/assigned agents. Claude is the
   // default (no flag → daemon auto-detects); every other pick is named
   // explicitly, or the daemon auto-detects and engines[0] silently wins.
-  const [engine, setEngine] = useState<'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini'>('claude')
+  const [engine, setEngine] = useState<RunnableEngineId>('claude')
   // Default on: install the always-on service (auto-start/restart/update).
   const [asService, setAsService] = useState(true)
   // Per-computer re-pair (reconnect) command, keyed by computer id.
@@ -1134,13 +1134,13 @@ function ComputersTab() {
             <div className="flex items-center gap-2.5 mb-2.5">
               <span className="text-[12px] text-ink-500">{t('me.engineLabel')}</span>
               <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                {([['claude', 'Claude Code'], ['codex', 'Codex'], ['grok', 'Grok Build'], ['cursor', 'Cursor'], ['opencode', 'OpenCode'], ['pi', 'pi'], ['gemini', 'Gemini']] as const).map(([id, label]) => (
+                {RUNNABLE_ENGINES.map((id) => (
                   <button key={id} type="button" onClick={() => setEngine(id)}
                     className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
                     style={engine === id
                       ? { background: 'var(--paper)', color: 'var(--ink-900)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }
                       : { color: 'var(--ink-500)' }}>
-                    {label}
+                    {engineLabel(id)}
                   </button>
                 ))}
               </div>
