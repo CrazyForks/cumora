@@ -3073,12 +3073,12 @@ api.post('/conversations/:id/members', async (req, res) => {
     `SELECT id FROM participants WHERE id = $1 AND company_id = $2`, [newMember, tenant],
   )
   if (!existing[0]) { res.status(400).json({ error: `unknown participant: ${newMember}` }); return }
-  const next = [...c.members, newMember]
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
-    [id, JSON.stringify(next), tenant],
-  )
-  const { postMembershipSystemMessage } = await import('../agents/membership.js')
+  const { addConversationMember, postMembershipSystemMessage } = await import('../agents/membership.js')
+  // Postgres edits the array. Splicing it here and writing the whole thing
+  // back loses a concurrent membership change, and the `joined` row below is
+  // posted either way — so the transcript would record a join that the
+  // members column does not agree with.
+  const next = await addConversationMember({ conversationId: id, memberId: newMember, companyId: tenant }) ?? []
   await postMembershipSystemMessage({
     conversationId: id, companyId: tenant, actorId: me,
     kind: 'joined', participantId: newMember,
@@ -3102,16 +3102,12 @@ api.post('/conversations/:id/leave', async (req, res) => {
     res.status(400).json({ error: 'cannot leave a direct conversation' }); return
   }
   if (!c.members.includes(me)) { res.status(409).json({ error: 'not a member' }); return }
-  const { postMembershipSystemMessage } = await import('../agents/membership.js')
+  const { postMembershipSystemMessage, removeConversationMember } = await import('../agents/membership.js')
   await postMembershipSystemMessage({
     conversationId: id, companyId: tenant, actorId: me,
     kind: 'left', participantId: me,
   })
-  const next = c.members.filter((m) => m !== me)
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
-    [id, JSON.stringify(next), tenant],
-  )
+  const next = await removeConversationMember({ conversationId: id, memberId: me, companyId: tenant }) ?? []
   res.json({ ok: true, members: next })
 })
 
