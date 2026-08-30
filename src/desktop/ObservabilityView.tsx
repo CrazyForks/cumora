@@ -283,9 +283,31 @@ function bytes(size: number): string {
   return `${Math.round(size / 1024 / 102.4) / 10} MB`
 }
 
+/** Neutral styling for a status this build has no entry for. `agent_runs.status`
+ *  is plain TEXT with no CHECK constraint, so a value outside the five known
+ *  ones is reachable — a newer server writing a status an older desktop build
+ *  does not know yet is the realistic case. Without a fallback,
+ *  `STATUS_STYLE[status].cls` threw and took the ENTIRE Observability view to
+ *  the error boundary: one unrecognised row, and the operator loses the traces,
+ *  the workspace browser and both economics panels. */
+const UNKNOWN_STATUS_STYLE = {
+  cls: 'bg-ink-100 text-ink-600 border-ink-100',
+  dot: 'var(--ink-400)',
+} as const
+
 function StatusPill({ status }: { status: ApiAgentRunStatus }) {
   const t = useT()
   const tone = STATUS_STYLE[status]
+  // Show the raw value rather than guessing at a label for it — mislabelling a
+  // status the build does not understand is worse than admitting it.
+  if (!tone) {
+    return (
+      <span className={cn('inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10.5px] font-bold', UNKNOWN_STATUS_STYLE.cls)}>
+        <span className="h-1.5 w-1.5 rounded-full" style={{ background: UNKNOWN_STATUS_STYLE.dot }} />
+        {String(status)}
+      </span>
+    )
+  }
   return (
     <span className={cn('inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10.5px] font-bold', tone.cls)}>
       <span className="h-1.5 w-1.5 rounded-full" style={{ background: tone.dot }} />
