@@ -15,7 +15,7 @@
  * `/api` because the cookie-auth middleware on /api would reject these
  * (and we don't want pods sharing the human session cookie path).
  */
-import { Router, type Request, type Response, type NextFunction } from 'express'
+import { Router, json, type Request, type Response, type NextFunction } from 'express'
 import { runCli } from '../cli.js'
 import { buildTriageRequest, gatherClaimsByConvo } from '../inbox-triage.js'
 import { buildTeamRosterText, getPersona } from '../personas.js'
@@ -33,6 +33,7 @@ import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
 import { verifyAgentToken, type AgentRuntimeClaims } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
+import { publicBodyParserError } from '../../body-parser-errors.js'
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -100,6 +101,17 @@ function withAgent(
 
 export const runtimeRouter: Router = Router()
 runtimeRouter.use(authMiddleware as never)
+// JWT signature, tenant claim, and current agent assignment are all checked
+// before any body parser reads JSON. Most runtime calls are small; the FUSE
+// whole-file write endpoint installs its compatibility parser at the route.
+const runtimeJsonParser = json({ limit: '4mb' })
+runtimeRouter.use((req, res, next) => {
+  if (req.method === 'PUT' && /^\/fs\/write\/?$/.test(req.path)) {
+    next()
+    return
+  }
+  runtimeJsonParser(req, res, next)
+})
 
 // ─── wake stream: server pushes events to the agent's long-running pod ─
 
@@ -776,3 +788,15 @@ runtimeRouter.post('/notices', withAgent(async (c, req, res) => {
   }
   res.json({ posted: out.posted })
 }))
+
+// Keep body-parser failures machine-readable and avoid exposing its default
+// HTML error page to runtime clients. Authentication failures have already
+// returned before this parser can run.
+runtimeRouter.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  const parserError = publicBodyParserError(err)
+  if (parserError) {
+    res.status(parserError.status).json({ error: parserError.message })
+    return
+  }
+  next(err)
+})

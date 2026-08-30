@@ -1,4 +1,4 @@
-import { Router, type Request, type Response, type NextFunction } from 'express'
+import { Router, json, type Request, type Response, type NextFunction } from 'express'
 import type { PoolClient } from 'pg'
 import {
   storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey,
@@ -8,6 +8,7 @@ import { pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, publish } from '../redis.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
+import { publicBodyParserError } from '../body-parser-errors.js'
 import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
@@ -110,6 +111,21 @@ export const api = Router()
 // a logged-in user call `requireAuth(req)` which throws 401 otherwise.
 api.use(authMiddleware as never)
 
+// Ordinary API payloads do not contain file bytes. Keep their ceiling small
+// even for anonymous/public endpoints so an unauthenticated caller can never
+// make the server parse the former global 34MB JSON allowance. The one route
+// that legitimately carries base64 file data is excluded here and installs
+// its larger parser only after a valid user session has been established.
+const defaultJsonParser = json({ limit: '256kb' })
+const uploadJsonParser = json({ limit: '34mb' })
+api.use((req, res, next) => {
+  if (req.method === 'POST' && /^\/uploads\/?$/.test(req.path)) {
+    next()
+    return
+  }
+  defaultJsonParser(req, res, next)
+})
+
 class HttpError extends Error {
   constructor(public status: number, message: string) { super(message) }
 }
@@ -119,6 +135,19 @@ function requireAuth(req: Request & AuthedRequest): string {
   const id = req.authUserId
   if (!id) throw new HttpError(401, 'authentication required')
   return id
+}
+
+/** Reject the only large JSON route before its parser consumes any bytes. */
+function requireAuthBeforeLargeBody(
+  req: Request & AuthedRequest,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!req.authUserId) {
+    res.status(401).json({ error: 'authentication required' })
+    return
+  }
+  next()
 }
 
 /** Backwards-compat alias for older handlers. Same semantics as requireAuth.
@@ -436,6 +465,11 @@ function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFun
     res.status(err.status).json({ error: err.message })
     return
   }
+  const parserError = publicBodyParserError(err)
+  if (parserError) {
+    res.status(parserError.status).json({ error: parserError.message })
+    return
+  }
   console.error('[api] 500', err)
   // Dev mode: surface the actual message + stack to the client so failures
   // can be debugged without log-diving. Production hides the cause.
@@ -522,7 +556,7 @@ api.post('/uploads/presign', async (req, res) => {
  * path AND the R2-mode fallback for tiny files where the round-trip cost
  * of presign isn't worth it.
  */
-api.post('/uploads', async (req, res) => {
+api.post('/uploads', requireAuthBeforeLargeBody, uploadJsonParser, async (req, res) => {
   // Auth + tenant gate. Without this, anyone on the open internet could push
   // 25MB blobs into our storage — a DoS + cost vector. Membership-only is
   // sufficient since attachments are a baseline chat feature.

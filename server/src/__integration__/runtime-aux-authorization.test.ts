@@ -37,7 +37,6 @@ before(async () => {
   const express = expressMod.default
   const { runtimeRouter } = await import('../agents/runtime/server.js')
   const app = express()
-  app.use(express.json({ limit: '4mb' }))
   app.use('/runtime', runtimeRouter)
   await new Promise<void>((resolve) => {
     server = createServer(app).listen(0, () => {
