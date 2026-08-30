@@ -456,6 +456,24 @@ export interface ApiTriagePriceRow {
   estimated: boolean
 }
 
+/** One row of `GET /agents/observability/wakes`. Group and direct are kept
+ *  apart deliberately: a DM legitimately answers far more often, so averaging
+ *  the two hides the number that matters. */
+export interface ApiSilentWakeBucket {
+  conversationKind: string
+  runs: number
+  silentRuns: number
+  silentRate: number
+  silentSpendUsd: number
+}
+
+export interface ApiWakeEconomics {
+  sinceHours: number
+  buckets: ApiSilentWakeBucket[]
+  /** The RATIOS are measured either way; only the dollar column is modelled. */
+  costEstimated: boolean
+}
+
 export interface ApiTriageEconomics {
   sinceHours: number
   triageCount: number
@@ -1264,6 +1282,13 @@ export const api = {
     if (filters?.sinceHours) q.set('sinceHours', String(filters.sinceHours))
     const suffix = q.toString() ? `?${q.toString()}` : ''
     return http<ApiTriageEconomics>(`/agents/observability/triage${suffix}`)
+  },
+  getWakeEconomics: (filters?: { agentId?: string | null; sinceHours?: number }) => {
+    const q = new URLSearchParams()
+    if (filters?.agentId) q.set('agentId', filters.agentId)
+    if (filters?.sinceHours) q.set('sinceHours', String(filters.sinceHours))
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return http<ApiWakeEconomics>(`/agents/observability/wakes${suffix}`)
   },
   getDevtoolsCapabilities: () => http<ApiDevtoolsCapabilities>('/devtools/capabilities'),
   listAgentWorkspace: (agentId: string) =>
