@@ -33,17 +33,18 @@ interface StoredEngines {
   detected: Array<{ id: string; blockedReason?: string | null; path?: string | null }>
 }
 
-async function seedCompany(): Promise<string> {
+async function seedCompany(): Promise<{ companyId: string; ownerUserId: string }> {
   const companyId = `co-${randomUUID().slice(0, 8)}`
+  const ownerUserId = `u-${companyId}`
   await pool.query(
     `INSERT INTO users (id, email, display_name) VALUES ($1, $2, 'Owner') ON CONFLICT (id) DO NOTHING`,
-    [`u-${companyId}`, `${companyId}@example.com`],
+    [ownerUserId, `${companyId}@example.com`],
   )
   await pool.query(
     `INSERT INTO companies (id, name, slug, owner_user_id) VALUES ($1, $1, $1, $2)`,
-    [companyId, `u-${companyId}`],
+    [companyId, ownerUserId],
   )
-  return companyId
+  return { companyId, ownerUserId }
 }
 
 async function storedEngines(computerId: string): Promise<StoredEngines> {
@@ -62,8 +63,8 @@ const SNAPSHOT = [
 ]
 
 test('[integration] pairing stores the refusal reason without making it runnable', async () => {
-  const companyId = await seedCompany()
-  const { code } = await issuePairingCode({ companyId })
+  const { companyId, ownerUserId } = await seedCompany()
+  const { code } = await issuePairingCode({ companyId, ownerUserId })
 
   const paired = await pairComputer({
     code, hostName: 'Dev Mac', engines: ['codex'], detected: SNAPSHOT, blocked: ['claude'],
@@ -87,14 +88,14 @@ test('[integration] reconnecting the same computer keeps the reason', async () =
   // A reconnect takes the other branch inside pairComputer, with its own
   // sanitize call. Wiring one branch and not the other would make the reason
   // appear at pairing and then vanish the next time the daemon restarted.
-  const companyId = await seedCompany()
+  const { companyId, ownerUserId } = await seedCompany()
   const first = await pairComputer({
-    code: (await issuePairingCode({ companyId })).code,
+    code: (await issuePairingCode({ companyId, ownerUserId })).code,
     hostName: 'Dev Mac', engines: ['codex'], detected: SNAPSHOT, blocked: ['claude'],
   })
   assert.ok(first)
 
-  const { code } = await issueRepairCodeFor(first.computerId, companyId)
+  const { code } = await issueRepairCodeFor(first.computerId, companyId, ownerUserId)
   const again = await pairComputer({
     code, hostName: 'Dev Mac', engines: ['codex'], detected: SNAPSHOT, blocked: ['claude'],
   })
@@ -107,9 +108,9 @@ test('[integration] reconnecting the same computer keeps the reason', async () =
 })
 
 test('[integration] the rescan report keeps the same separation', async () => {
-  const companyId = await seedCompany()
+  const { companyId, ownerUserId } = await seedCompany()
   const paired = await pairComputer({
-    code: (await issuePairingCode({ companyId })).code,
+    code: (await issuePairingCode({ companyId, ownerUserId })).code,
     hostName: 'Dev Mac', engines: ['codex', 'claude'], detected: SNAPSHOT,
   })
   assert.ok(paired)
@@ -128,9 +129,9 @@ test('[integration] the rescan report keeps the same separation', async () => {
 test('[integration] fixing the cause clears the reason on the next report', async () => {
   // The reason is state, not a one-way flag: upgrading the CLI has to make the
   // card go quiet again without any other change.
-  const companyId = await seedCompany()
+  const { companyId, ownerUserId } = await seedCompany()
   const paired = await pairComputer({
-    code: (await issuePairingCode({ companyId })).code,
+    code: (await issuePairingCode({ companyId, ownerUserId })).code,
     hostName: 'Dev Mac', engines: ['codex'], detected: SNAPSHOT, blocked: ['claude'],
   })
   assert.ok(paired)
@@ -155,9 +156,9 @@ test('[integration] a daemon claiming a blocked engine is runnable does not get 
   // Belt and braces on the invariant, from the direction a buggy or hostile
   // daemon would come at it: sending the same id in both lists must not put a
   // refused engine into the list that picks an adapter.
-  const companyId = await seedCompany()
+  const { companyId, ownerUserId } = await seedCompany()
   const paired = await pairComputer({
-    code: (await issuePairingCode({ companyId })).code,
+    code: (await issuePairingCode({ companyId, ownerUserId })).code,
     hostName: 'Dev Mac', engines: ['codex'], detected: SNAPSHOT, blocked: ['claude'],
   })
   assert.ok(paired)
@@ -173,9 +174,11 @@ test('[integration] a daemon claiming a blocked engine is runnable does not get 
 })
 
 /** Mint a reconnect code for an existing computer row. */
-async function issueRepairCodeFor(computerId: string, companyId: string): Promise<{ code: string }> {
+async function issueRepairCodeFor(
+  computerId: string, companyId: string, ownerUserId: string,
+): Promise<{ code: string }> {
   const { issueRepairCode } = await import('../agents/computer/registry.js')
-  const out = await issueRepairCode({ computerId, companyId })
+  const out = await issueRepairCode({ computerId, companyId, ownerUserId })
   assert.ok(out, 'could not mint a repair code')
   return out
 }
