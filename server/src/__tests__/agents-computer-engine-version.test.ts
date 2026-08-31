@@ -118,6 +118,7 @@ test('sanitizeDetectedEngines carries version fields through', () => {
     id: 'codex', bin: 'codex', path: '/usr/local/bin/codex',
     version: '0.5.0', latest: '0.6.0', outdated: true,
     updateCommand: 'npm install -g @openai/codex@latest',
+    blockedReason: null,
   }])
 })
 

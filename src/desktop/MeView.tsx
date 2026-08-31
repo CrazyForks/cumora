@@ -784,6 +784,7 @@ type AgentRow = {
   latest?: string | null
   outdated?: boolean
   updateCommand?: string | null
+  blockedReason?: string | null
 }
 
 const CLI_ORDER = [
@@ -1080,10 +1081,25 @@ function ComputersTab() {
                                       {t('me.agentsCliUpdateAvailable')}
                                     </span>
                                   )}
-                                  {!engineId && (
+                                  {/* Two different things, deliberately not one
+                                      label: "not runnable" means Cumora has no
+                                      adapter for this CLI and the operator can
+                                      do nothing about it, while "blocked" means
+                                      it is supported but was refused here for a
+                                      reason they can act on. */}
+                                  {row.blockedReason ? (
+                                    <span className="text-[12px] font-semibold px-2 py-0.5 rounded-full shrink-0 bg-coral-soft text-coral-deep">
+                                      {t('me.agentsCliBlocked')}
+                                    </span>
+                                  ) : !engineId && (
                                     <span className="text-[12px] text-ink-400 truncate">{t('me.agentsNotRunnable')}</span>
                                   )}
                                 </div>
+                                {row.blockedReason && (
+                                  <div className="mt-1 text-[12px] leading-[1.55] text-coral-deep">
+                                    {t('me.agentsCliBlockedReason', { reason: row.blockedReason })}
+                                  </div>
+                                )}
                                 <div className="mt-1 flex items-center min-w-0 font-mono text-[12px] text-ink-400">
                                   <span className="shrink-0">{row.bin}</span>
                                   {row.path && (

@@ -4583,6 +4583,9 @@ export interface DetectedEngineSnapshot {
   latest?: string | null
   outdated?: boolean
   updateCommand?: string | null
+  /** Why this installed engine will NOT be driven — the reason
+   *  evaluateRunnableEngines() produced. Absent on runnable engines. */
+  blockedReason?: string
 }
 
 /** Snapshot the installed engines, optionally in a caller-supplied order

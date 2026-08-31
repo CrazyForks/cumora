@@ -48,8 +48,10 @@ test('sanitizeDetectedEngines drops unknown ids and fills missing bins', () => {
     ['claude', 'codex', 'gemini', 'bogus'],
   )
   // Version fields come back on every row — null here, since a daemon this old
-  // reports paths only. See agents-computer-engine-version.test.ts.
-  const noVersion = { version: null, latest: null, outdated: false, updateCommand: null }
+  // reports paths only. See agents-computer-engine-version.test.ts. blockedReason
+  // is null for the same reason every key is present on every row: the app must
+  // never have to tell "field absent" from "nothing to report".
+  const noVersion = { version: null, latest: null, outdated: false, updateCommand: null, blockedReason: null }
   assert.deepEqual(out, [
     { id: 'claude', bin: 'claude', path: '/usr/bin/claude', ...noVersion },
     { id: 'codex', bin: 'codex', path: null, ...noVersion },

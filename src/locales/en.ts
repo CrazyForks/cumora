@@ -1294,6 +1294,8 @@ export const en = {
   'me.agentsIsDefault': 'Default',
   'me.agentsOffline': 'This computer is offline. The list is still the last pairing report.',
   'me.agentsNoEngines': 'The daemon reported no engines at pairing. Re-run the pairing command on that computer to scan PATH again.',
+  'me.agentsCliBlocked': 'Not used',
+  'me.agentsCliBlockedReason': 'Installed, but Cumora will not run it here: {reason}. Until that is fixed, agents on this computer cannot use it.',
   'me.agentsNotRunnable': 'Detected only — Cumora cannot run this yet',
   'me.agentsNeedPair': 'Re-pair to use',
   'me.agentsCliUnknown': 'version unknown',

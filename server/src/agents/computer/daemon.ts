@@ -3096,17 +3096,33 @@ async function doRun(serverOverride?: string): Promise<void> {
       // engine's version *as installed on this machine*: the app renders it
       // verbatim and never probes its own PATH, because whoever is looking at
       // the card is usually not sitting at the machine it describes.
-      const snapshot = await enrichDetectedEngines(await snapshotDetectedEngines(next))
+      // Blocked engines ride along as extra display rows carrying the reason
+      // they were refused. Until now that reason existed only as the
+      // console.warn above — on a machine the operator is usually not sitting
+      // at — so an engine could disappear from the card with no explanation
+      // anywhere they could see. They stay OUT of `next`: that list becomes
+      // available_engines and picks an agent's adapter.
+      const blockedIds = evaluated.blocked.map(({ id }) => id)
+      const blockedRows = (await snapshotDetectedEngines(blockedIds)).map((row) => ({
+        ...row,
+        blockedReason: evaluated.blocked.find(({ id }) => id === row.id)?.reason,
+      }))
+      const snapshot = [
+        ...await enrichDetectedEngines(await snapshotDetectedEngines(next)),
+        ...await enrichDetectedEngines(blockedRows),
+      ]
       // Report on version drift too, not just install/uninstall — upgrading an
       // engine in place leaves the engine *list* identical, and that is exactly
-      // when the card's version line goes stale.
+      // when the card's version line goes stale. The blocked reasons are part
+      // of the fingerprint: fixing the cause (upgrading the CLI, installing
+      // bwrap) has to clear the card, not wait for an unrelated change.
       const fingerprint = JSON.stringify(snapshot)
       if (shouldReportEngineSnapshot(fingerprint, lastEngineSnapshot, forceReport)) {
         lastEngineSnapshot = fingerprint
         await api(cfg.serverUrl, '/api/computers/me/engines', {
           method: 'POST',
           headers: { Authorization: `Bearer ${cfg.deviceToken}` },
-          body: JSON.stringify({ engines: next, detected: snapshot }),
+          body: JSON.stringify({ engines: next, detected: snapshot, blocked: blockedIds }),
         }).catch((err) => {
           console.warn('[computer] engine snapshot report failed', err instanceof Error ? err.message : err)
         })
