@@ -82,9 +82,17 @@ jobs:
           TAG="${{ steps.tag.outputs.tag }}"
           AR="${{ env.AR_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.AR_REPO }}"
 
-          SERVER_DIGEST=$(gcloud artifacts docker images list "$AR/server" \
-            --include-tags --filter "tags:$TAG" \
-            --format='value(version)' 2>/dev/null | grep '^sha256:' | head -1)
+          # Resolve through the tag REFERENCE, never `list --filter`. The
+          # filter's `tags:X` is a substring match over every tag in the repo,
+          # so `tags:89e7022` also matched 5e60594, 706e708, 7e34456 and five
+          # more; `head -1` then picked whichever digest sorted first, which on
+          # 2026-08-31 was a June image. That deploy rolled a three-month-old
+          # server into production and was only caught because the image
+          # predated /api/shipping/overview and the smoke gate 404'd. `tags=X`
+          # is no better — it fuzzy-matches too. `describe <image>:<tag>` is
+          # exact, and leaves the digest empty when the tag does not exist.
+          SERVER_DIGEST=$(gcloud artifacts docker images describe "$AR/server:$TAG" \
+            --format='value(image_summary.digest)' 2>/dev/null)
           if [ -z "$SERVER_DIGEST" ]; then
             echo "::error::server tag $TAG not found in AR"
             exit 1
@@ -93,9 +101,8 @@ jobs:
           echo "→ server: $AR/server@$SERVER_DIGEST"
 
           if [ "${{ steps.tag.outputs.include_agent }}" = "Y" ]; then
-            AGENT_DIGEST=$(gcloud artifacts docker images list "$AR/agent-computer" \
-              --include-tags --filter "tags:$TAG" \
-              --format='value(version)' 2>/dev/null | grep '^sha256:' | head -1)
+            AGENT_DIGEST=$(gcloud artifacts docker images describe "$AR/agent-computer:$TAG" \
+              --format='value(image_summary.digest)' 2>/dev/null)
             if [ -z "$AGENT_DIGEST" ]; then
               echo "::error::agent-computer tag $TAG not found in AR while include_agent=Y"
               echo "::error::Refusing a server-only deploy because runtime/CLI shim changes require server and agent-computer to stay on the same SHA. For an intentional server-only rollback, rerun manually with include_agent=N."
