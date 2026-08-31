@@ -345,6 +345,11 @@ export async function pairComputer(args: {
   engines?: string[]
   /** Optional PATH snapshot from the daemon (bin + resolved path). */
   detected?: unknown
+  /** Installed engines the daemon refused to run, so the card can say why from
+   *  the very first pairing rather than only after the next PATH rescan — which
+   *  is minutes later, and right after pairing is exactly when "why is only
+   *  codex here?" gets asked. Display-only; never joins available_engines. */
+  blocked?: string[]
   /** The daemon's running version, stored so the app can flag outdated daemons. */
   version?: string
   /** Whether the daemon runs supervised (service) vs. as a foreground command. */
@@ -356,7 +361,8 @@ export async function pairComputer(args: {
   deferBroadcast?: boolean
 }): Promise<{ computerId: string; companyId: string; deviceToken: string } | null> {
   const engines = (args.engines ?? []).filter((e) => PAIRABLE_ENGINES.has(e))
-  const detected = sanitizeDetectedEngines(args.detected, engines)
+  const blocked = args.blocked ?? []
+  const detected = sanitizeDetectedEngines(args.detected, engines, blocked)
   const detectedJson = JSON.stringify(detected)
   const version = typeof args.version === 'string' && args.version ? args.version.slice(0, 32) : null
   const supervised = typeof args.supervised === 'boolean' ? args.supervised : null
@@ -376,7 +382,7 @@ export async function pairComputer(args: {
     // the existing default first while it is still installed; if it vanished,
     // mergeDetectedEngines naturally falls back to the daemon's scan order.
     const orderedEngines = mergeDetectedEngines(currentEngines ?? [], engines) ?? (currentEngines ?? [])
-    const reconnectDetectedJson = JSON.stringify(sanitizeDetectedEngines(args.detected, orderedEngines))
+    const reconnectDetectedJson = JSON.stringify(sanitizeDetectedEngines(args.detected, orderedEngines, blocked))
     await pool.query(
       `UPDATE computers
           SET credential_hash = $1, available_engines = $2::jsonb,

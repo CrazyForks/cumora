@@ -130,3 +130,36 @@ test('a blocked engine the daemon reported nothing about still gets a row', () =
   const out = sanitizeDetectedEngines(null, ['codex'], ['claude'])
   assert.deepEqual(out.map((e) => e.id), ['codex', 'claude'])
 })
+
+// --- every path that stores a snapshot, not just the rescan ---
+
+test('the reason travels on the pairing snapshot, not only the rescan', () => {
+  // The first version of this feature wired only the periodic PATH rescan, so a
+  // freshly paired computer showed nothing for minutes — exactly the window in
+  // which someone asks why their Claude Code is missing. pairComputer() and the
+  // reconnect branch sanitize their own snapshots, so they need the same list.
+  const out = sanitizeDetectedEngines(
+    [
+      { id: 'codex', bin: 'codex', path: '/bin/codex' },
+      { id: 'claude', bin: 'claude', path: '/bin/claude', blockedReason: OLD_CLAUDE },
+    ],
+    ['codex'],
+    ['claude'],
+  )
+  assert.equal(out.find((e) => e.id === 'claude')?.blockedReason, OLD_CLAUDE)
+})
+
+test('a blocked engine never reaches the runnable list it is derived from', () => {
+  // The invariant stated as the caller sees it: whatever this returns for
+  // display, `available_engines` is built from the runnable ids alone, so a
+  // blocked engine cannot become the adapter an agent runs on.
+  const runnable = ['codex']
+  const out = sanitizeDetectedEngines(
+    [{ id: 'claude', bin: 'claude', path: '/bin/claude', blockedReason: OLD_CLAUDE }],
+    runnable,
+    ['claude'],
+  )
+  assert.deepEqual(runnable, ['codex'], 'the runnable list must not be mutated')
+  assert.ok(out.some((e) => e.id === 'claude' && e.blockedReason))
+  assert.ok(!runnable.includes('claude'))
+})
