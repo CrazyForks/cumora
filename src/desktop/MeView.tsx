@@ -960,78 +960,104 @@ function ComputersTab() {
             const repairCmd = repairCode ? `npx cumora@latest agent computer --pair ${repairCode}${serverFlag}` : ''
             const rows = repairable ? pairedRows(c) : []
             const detecting = busyId === c.id
+            // Extracted so the header can be wrapped in either a plain
+            // container or a real toggle control without duplicating it.
+            const headerBody = (
+              <>
+                    <div className="text-[22px] w-8 text-center">{KIND_ICON[c.kind] ?? '🖥'}</div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-display font-medium text-[16px] text-ink-900">{c.name}</span>
+                        <span className="inline-flex items-center gap-1.5 text-[11px] text-ink-500">
+                          <span className="w-2 h-2 rounded-full" style={{ background: STATUS_COLOR[c.status] ?? 'var(--ink-300)' }} />
+                          {t(COMPUTER_STATUS_KEY[c.status] ?? 'me.computerStatus.offline')}
+                        </span>
+                        {c.daemonOutdated && (
+                          <span className="inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-full"
+                            style={{ background: 'rgba(244,183,64,0.18)', color: 'var(--gold-deep)' }}
+                            title={c.latestDaemonVersion ? t('me.updateToVersion', { version: c.latestDaemonVersion }) : t('me.updateAvailableTitle')}>
+                            ↑ {t('me.updateAvailableShort')}{c.daemonVersion ? ` · ${t('me.daemonVersion', { version: c.daemonVersion })}` : ''}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center text-[12px] text-ink-500 mt-0.5">
+                        {repairable
+                          ? (
+                            <>
+                              <span>
+                                {rows.length > 0
+                                  ? (rows.length === 1 ? t('me.agentsCliDetectedOne', { n: rows.length }) : t('me.agentsCliDetectedOther', { n: rows.length }))
+                                  : (n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n }))}
+                              </span>
+                              {c.daemonVersion && (
+                                <>
+                                  <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
+                                  <span>{t('me.daemonVersionLocal', { version: c.daemonVersion })}</span>
+                                </>
+                              )}
+                            </>
+                          )
+                          : (
+                            <>
+                              {c.availableEngines.map((e) => ENGINE_LABEL[e] ?? e).join(', ') || '—'}
+                              {' · '}{n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n })}
+                            </>
+                          )}
+                      </div>
+                    </div>
+                    {repairable && (
+                      <>
+                        <button type="button" disabled={detecting} onClick={(e) => { e.stopPropagation(); void refreshEngines(c.id) }}
+                          className="text-[12px] font-semibold text-skype-deep disabled:opacity-45 px-2 py-1">
+                          {detecting ? t('me.agentsRefreshing') : t('me.agentsRefresh')}
+                        </button>
+                        {/* Was a bare span riding the header's onClick. The header
+                            now opens the engine list, so reconnect needs its own
+                            handler — and must not also toggle the list. */}
+                        <button type="button" onClick={(e) => { e.stopPropagation(); void toggleRepair(c.id) }}
+                          className="text-[12px] font-semibold text-skype-deep px-2 py-1">
+                          {expanded ? t('me.hideAction') : t('me.reconnect')}
+                        </button>
+                        <button type="button" onClick={(e) => { e.stopPropagation(); void remove(c.id, c.name) }}
+                          className="text-[12px] font-semibold text-coral-deep hover:underline px-2 py-1">
+                          {t('me.remove')}
+                        </button>
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                          strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+                          className="text-ink-300 shrink-0 transition-transform"
+                          style={{ transform: enginesShown ? 'rotate(180deg)' : 'none' }}>
+                          <path d="M6 9l6 6 6-6" />
+                        </svg>
+                      </>
+                    )}
+              </>
+            )
+            // A card whose engine list can be opened IS a disclosure control,
+            // so it carries the role, a focus stop, the expanded state and a
+            // keyboard path. Written as two branches rather than one element
+            // with a conditional role: a role the linter cannot resolve reads
+            // as a plain div, which is how the aria-expanded here came to be
+            // dropped in #129. Cloud cards toggle nothing and stay inert.
+            const header = repairable ? (
+              <div
+                className="p-4 flex items-center gap-4 rounded-[14px] cursor-pointer hover:bg-sky2-50"
+                role="button"
+                tabIndex={0}
+                aria-expanded={enginesShown}
+                onClick={() => toggleEngines(c.id)}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter' && e.key !== ' ') return
+                  e.preventDefault()
+                  toggleEngines(c.id)
+                }}>
+                {headerBody}
+              </div>
+            ) : (
+              <div className="p-4 flex items-center gap-4 rounded-[14px]">{headerBody}</div>
+            )
             return (
               <div key={c.id} className="bg-cloud rounded-[14px]" style={{ border: '1px solid var(--ink-100)' }}>
-                <div
-                  className={cn('p-4 flex items-center gap-4 rounded-[14px]', repairable && 'cursor-pointer hover:bg-sky2-50')}
-                  onClick={repairable ? () => toggleEngines(c.id) : undefined}>
-                  <div className="text-[22px] w-8 text-center">{KIND_ICON[c.kind] ?? '🖥'}</div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="font-display font-medium text-[16px] text-ink-900">{c.name}</span>
-                      <span className="inline-flex items-center gap-1.5 text-[11px] text-ink-500">
-                        <span className="w-2 h-2 rounded-full" style={{ background: STATUS_COLOR[c.status] ?? 'var(--ink-300)' }} />
-                        {t(COMPUTER_STATUS_KEY[c.status] ?? 'me.computerStatus.offline')}
-                      </span>
-                      {c.daemonOutdated && (
-                        <span className="inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-full"
-                          style={{ background: 'rgba(244,183,64,0.18)', color: 'var(--gold-deep)' }}
-                          title={c.latestDaemonVersion ? t('me.updateToVersion', { version: c.latestDaemonVersion }) : t('me.updateAvailableTitle')}>
-                          ↑ {t('me.updateAvailableShort')}{c.daemonVersion ? ` · ${t('me.daemonVersion', { version: c.daemonVersion })}` : ''}
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex items-center text-[12px] text-ink-500 mt-0.5">
-                      {repairable
-                        ? (
-                          <>
-                            <span>
-                              {rows.length > 0
-                                ? (rows.length === 1 ? t('me.agentsCliDetectedOne', { n: rows.length }) : t('me.agentsCliDetectedOther', { n: rows.length }))
-                                : (n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n }))}
-                            </span>
-                            {c.daemonVersion && (
-                              <>
-                                <span className="shrink-0 text-ink-300" style={{ marginLeft: 10, marginRight: 10 }}>·</span>
-                                <span>{t('me.daemonVersionLocal', { version: c.daemonVersion })}</span>
-                              </>
-                            )}
-                          </>
-                        )
-                        : (
-                          <>
-                            {c.availableEngines.map((e) => ENGINE_LABEL[e] ?? e).join(', ') || '—'}
-                            {' · '}{n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n })}
-                          </>
-                        )}
-                    </div>
-                  </div>
-                  {repairable && (
-                    <>
-                      <button type="button" disabled={detecting} onClick={(e) => { e.stopPropagation(); void refreshEngines(c.id) }}
-                        className="text-[12px] font-semibold text-skype-deep disabled:opacity-45 px-2 py-1">
-                        {detecting ? t('me.agentsRefreshing') : t('me.agentsRefresh')}
-                      </button>
-                      {/* Was a bare span riding the header's onClick. The header
-                          now opens the engine list, so reconnect needs its own
-                          handler — and must not also toggle the list. */}
-                      <button type="button" onClick={(e) => { e.stopPropagation(); void toggleRepair(c.id) }}
-                        className="text-[12px] font-semibold text-skype-deep px-2 py-1">
-                        {expanded ? t('me.hideAction') : t('me.reconnect')}
-                      </button>
-                      <button type="button" onClick={(e) => { e.stopPropagation(); void remove(c.id, c.name) }}
-                        className="text-[12px] font-semibold text-coral-deep hover:underline px-2 py-1">
-                        {t('me.remove')}
-                      </button>
-                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
-                        strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
-                        className="text-ink-300 shrink-0 transition-transform"
-                        style={{ transform: enginesShown ? 'rotate(180deg)' : 'none' }}>
-                        <path d="M6 9l6 6 6-6" />
-                      </svg>
-                    </>
-                  )}
-                </div>
+                {header}
                 {repairable && enginesShown && (
                   rows.length === 0 ? (
                     <div className="px-4 pb-4 text-[12px] text-ink-400">{t('me.agentsNoEngines')}</div>
