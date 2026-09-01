@@ -3,7 +3,8 @@
  *
  * A long-running process on the user's machine (laptop or VPS) that hosts one
  * or more of their Cumora agents, using a local engine (Claude Code / Codex / pi /
- * Grok Build / Cursor Agent / OpenCode) as each agent's brain. See docs/BYOA.md.
+ * Grok Build / Cursor Agent / OpenCode / Gemini / Qwen / Antigravity) as each
+ * agent's brain. See docs/BYOA.md.
  *
  * It talks to the Cumora server only over HTTP — no DB/Redis — so it can run
  * anywhere:
@@ -652,6 +653,9 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'pi') {
     return 'Open pi on that computer and run `/login` for its provider (or fix the API key / quota), then wake the agent again.'
   }
+  if (engine === 'antigravity') {
+    return 'Open Antigravity on that computer and run `agy` to refresh its login, model access, or quota, then wake the agent again.'
+  }
   return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
 }
 
@@ -668,6 +672,9 @@ function missingEngineMessage(): string {
     '  - Cursor Agent: install Cursor (the `cursor-agent` CLI ships with it), then run `cursor-agent login`',
     '  - OpenCode: install the `opencode` CLI, then run `opencode providers login` once',
     '  - pi: `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`, then run `pi` once and `/login` a provider',
+    '  - Gemini CLI: install the `gemini` CLI, then run `gemini` once to sign in',
+    '  - Qwen Code: install the `qwen` CLI, then run `qwen` once to sign in',
+    '  - Antigravity: install the `agy` CLI, then run `agy` once to sign in',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -681,7 +688,7 @@ function sandboxedEngineMessage(installed: readonly EngineId[]): string {
     process.platform === 'win32'
       ? 'Use Codex on native Windows, or run Claude Code inside WSL2.'
       : 'Install and sign in to Claude Code or Codex.',
-    'Grok, Cursor, OpenCode, pi, Gemini, and native-Windows Claude currently lack',
+    'Grok, Cursor, OpenCode, pi, Gemini, Qwen, Antigravity, and native-Windows Claude currently lack',
     'a Cumora-verified fail-closed host boundary.',
     '',
     'Compatibility only (grants the model your host files, environment, and network):',
@@ -706,7 +713,7 @@ function helpText(): string {
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
     'engine. Claude Code and Codex are sandboxed by default. Grok Build, Cursor',
-    'Agent, OpenCode, pi, Gemini, and native-Windows Claude require the explicit',
+    'Agent, OpenCode, pi, Gemini, Qwen, Antigravity, and native-Windows Claude require the explicit',
     'high-risk CUMORA_BYOA_ALLOW_UNSANDBOXED=1 compatibility switch.',
     'Pair once, then the daemon runs in the background.',
     '',
@@ -1988,6 +1995,7 @@ class AgentRunner {
     if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
     if (this.adapter.id === 'opencode') return this.agent.model ?? '<opencode-default>'
     if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
+    if (this.adapter.id === 'antigravity') return this.agent.model ?? '<antigravity-default>'
     return this.agent.model ?? '<cursor-default>'
   }
 

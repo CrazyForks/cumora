@@ -8,6 +8,7 @@ import assert from 'node:assert/strict'
 
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
 process.env.CUMORA_DEFAULT_CLAUDE_MODEL = 'claude-opus-4-7'
+process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL = 'Gemini 3.5 Flash (High)'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
 const registry = await import('../agents/computer/registry.js')
@@ -45,7 +46,7 @@ after(async () => {
 test('sanitizeDetectedEngines drops unknown ids and fills missing bins', () => {
   const out = registry.sanitizeDetectedEngines(
     [{ id: 'claude', bin: 'claude', path: '/usr/bin/claude' }, { id: 'bogus', bin: 'x', path: null }],
-    ['claude', 'codex', 'gemini', 'bogus'],
+    ['claude', 'codex', 'gemini', 'antigravity', 'bogus'],
   )
   // Version fields come back on every row — null here, since a daemon this old
   // reports paths only. See agents-computer-engine-version.test.ts.
@@ -54,6 +55,7 @@ test('sanitizeDetectedEngines drops unknown ids and fills missing bins', () => {
     { id: 'claude', bin: 'claude', path: '/usr/bin/claude', ...noVersion },
     { id: 'codex', bin: 'codex', path: null, ...noVersion },
     { id: 'gemini', bin: 'gemini', path: null, ...noVersion },
+    { id: 'antigravity', bin: 'agy', path: null, ...noVersion },
   ])
 })
 
@@ -63,6 +65,7 @@ test('listAgentsForComputer keeps an explicit model and pins CUMORA_DEFAULT_* wh
       return { rows: [
         { id: 'bram', name: 'Bram', role: 'engineer', systemPrompt: null, engine: 'claude', model: 'stale-pin', fastModel: 'haiku' },
         { id: 'saga', name: 'Saga', role: 'writer', systemPrompt: null, engine: 'claude', model: null, fastModel: null },
+        { id: 'aster', name: 'Aster', role: 'reviewer', systemPrompt: null, engine: 'antigravity', model: null, fastModel: null },
       ] }
     }
     return { rows: [] }
@@ -72,6 +75,8 @@ test('listAgentsForComputer keeps an explicit model and pins CUMORA_DEFAULT_* wh
   assert.equal(agents[0]?.fastModel, 'haiku')
   assert.equal(agents[1]?.model, 'claude-opus-4-7')
   assert.equal(agents[1]?.engine, 'claude')
+  assert.equal(agents[2]?.model, 'Gemini 3.5 Flash (High)')
+  assert.equal(agents[2]?.engine, 'antigravity')
 })
 
 test('reportDetectedEngines keeps the previous default first when it is still installed', async () => {

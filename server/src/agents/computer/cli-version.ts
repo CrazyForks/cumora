@@ -115,6 +115,10 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
     versionArgs: ['--version'],
     npm: '@qwen-code/qwen-code',
   },
+  antigravity: {
+    versionArgs: ['--version'],
+    selfUpdate: 'agy update',
+  },
   hermes: {
     versionArgs: ['version'],
     selfUpdate: 'hermes update',
