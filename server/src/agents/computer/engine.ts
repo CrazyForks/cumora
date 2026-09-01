@@ -1682,6 +1682,17 @@ export function noteCodexConfigRejection(err: string | undefined, onLog?: (line:
   return true
 }
 
+/** The `-c` sandbox profile without the `exec`-only tail, so the persistent
+ *  app-server path is confined by exactly the same profile as the one-shot path.
+ *  This is the set production has since run clean: zero config rejections across
+ *  every turn on 0.11.1 daemons. */
+function codexSecureConfigOverrides(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
+  const full = codexSecureExecArgs(args, readOnly)
+  const exec = full.indexOf('exec')
+  // Everything before `-a never exec …` is the config profile.
+  return exec === -1 ? full : full.slice(0, Math.max(0, exec - 2))
+}
+
 function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
   const workspaceAccess = readOnly ? 'read' : 'write'
   const filesystemEntries = [
@@ -2184,10 +2195,20 @@ class CodexAdapter implements EngineAdapter {
     // Escape hatches → fall back to one-shot `codex exec` (run()): a custom-args
     // override, an explicit opt-out, or Windows (JSON-RPC over a .cmd shell is
     // fragile; exec is the safe path there).
-    // app-server currently has no equivalent to exec --ignore-user-config, so
-    // user MCP/hook/config layers cannot be excluded. Keep the secure default
-    // on the one-shot path; persistent compatibility is an explicit opt-in.
-    if (!allowUnsandboxedByoa()) return null
+    //
+    // This used to `return null` unless BYOA was explicitly unsandboxed, because
+    // app-server has no equivalent to `exec --ignore-user-config`. The cost of
+    // that was invisible in the code: with no persistent process every codex
+    // turn is a fresh session, so agents answered each message with no memory of
+    // the one before — what users reported as the agent not remembering the
+    // previous exchange.
+    //
+    // `-c` are global flags and DO apply to app-server, so the filesystem,
+    // network, environment and feature profile below is identical on both paths.
+    // What app-server cannot exclude is a user's own ~/.codex adding EXTRA
+    // mcp_servers — a narrower gap than losing every agent's continuity, on the
+    // operator's own machine, with their own config. CUMORA_CODEX_NO_APP_SERVER=1
+    // still opts out, and a failing session degrades to one-shot (see daemon.ts).
     if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length) return null
     if (process.env.CUMORA_CODEX_NO_APP_SERVER === '1') return null
     if (IS_WIN) return null
@@ -2196,7 +2217,13 @@ class CodexAdapter implements EngineAdapter {
     // Standing prompt rides the thread's developerInstructions (see CodexSession),
     // approval/sandbox are set per-thread, so no global bypass flags are needed.
     const { command, argsPrefix } = resolveCodexSpawn()
-    return new CodexSession(command, [...argsPrefix, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
+    // Confine the persistent process with the same profile the one-shot path
+    // uses. `-c` are global flags and apply to app-server too, so filesystem,
+    // network, environment and features are identical on both paths.
+    const secure = allowUnsandboxedByoa()
+      ? []
+      : codexSecureConfigOverrides({ home: args.home, env: args.env })
+    return new CodexSession(command, [...argsPrefix, ...secure, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
   }
 }
 

@@ -339,6 +339,32 @@ interface AgentInfo {
   fastModel: string | null
 }
 
+/** One line's worth of "there is a file on this message".
+ *
+ *  The attachment already travelled: /inbox selects `m.attachment` and the
+ *  daemon received it. It was simply never rendered, so a BYOA agent saw the
+ *  text of a message and no sign that a file came with it — and said so, truthfully,
+ *  when a user asked why it could not see their zip. The cloud path (turn.ts)
+ *  has always surfaced attachments; only this one dropped them.
+ *
+ *  Name, type and size go inline so the agent can reason about the file, and the
+ *  URL follows so it can actually fetch it. Bounded, because this shares the
+ *  digest's line budget with the message bodies. */
+export function attachmentNote(
+  att: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null | undefined,
+): string {
+  if (!att || typeof att !== 'object') return ''
+  const name = typeof att.name === 'string' && att.name.trim() ? att.name.trim().slice(0, 120) : 'file'
+  const type = typeof att.mime === 'string' && att.mime.trim()
+    ? att.mime.trim().slice(0, 60)
+    : (typeof att.kind === 'string' ? att.kind.slice(0, 20) : '')
+  const size = typeof att.size === 'number' && Number.isFinite(att.size) && att.size > 0
+    ? ` ${att.size >= 1024 * 1024 ? `${(att.size / 1024 / 1024).toFixed(1)}MB` : `${Math.max(1, Math.round(att.size / 1024))}KB`}`
+    : ''
+  const url = typeof att.url === 'string' && /^https?:\/\//.test(att.url) ? ` ${att.url}` : ''
+  return `  [attachment: ${name}${type ? ` · ${type}` : ''}${size}${url}]`
+}
+
 interface RuntimeInboxResponse {
   rows?: Array<{
     id?: string
@@ -352,6 +378,9 @@ interface RuntimeInboxResponse {
     author_kind?: string
     body?: string
     kind?: string
+    /** Already delivered by /inbox (loadInbox selects m.attachment) and, until
+     *  now, dropped on the floor when the digest line was built. */
+    attachment?: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null
     sequence?: number
   }>
 }
@@ -1441,6 +1470,11 @@ class AgentRunner {
    *  on a frozen inbox snapshot. Captured from each run's stream-json output;
    *  cleared if a resume fails so the next wake starts a clean session. */
   private sessionId: string | null = null
+  /** Set when the persistent engine process proved unusable on this machine, so
+   *  the runner stops trying it and stays on the one-shot path. Without this a
+   *  process that starts and then fails every turn fails every turn forever;
+   *  with it, the worst case is exactly the pre-persistent behaviour. */
+  private persistentUnusable = false
   /** The long-lived engine process (persistent stream-json for claude, app-server
    *  thread for codex), created lazily and reused across wakes so turns 2..N skip
    *  the cold start. Null = not yet started, dead (respawn next turn), or this
@@ -1769,6 +1803,7 @@ class AgentRunner {
    *  carries across the restart. */
   private ensureEngineSession(): EngineSession | null {
     if (!this.adapter.startSession) return null
+    if (this.persistentUnusable) return null
     if (this.engineSession?.alive) return this.engineSession
     this.engineSession = this.adapter.startSession({
       home: this.home,
@@ -2076,7 +2111,7 @@ class AgentRunner {
       // Keep the message id + convo id on each line (like the cloud agent's
       // context) so the engine can QUOTE the exact message: `cumora reply
       // <convo> '<body>' --quote <message_id>`.
-      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}`)
+      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNote(row.attachment)}`)
     }
     const projectIds = uniqueProjectIds(
       (inbox?.rows ?? []).map((r) => (typeof r.project_id === 'string' ? r.project_id : null)),
@@ -2726,6 +2761,31 @@ class AgentRunner {
             // Process died during/after the turn → drop it so the next wake respawns
             // (with --resume this.sessionId to carry context across the restart).
             if (!session.alive) this.engineSession = null
+            // A persistent process that dies without producing a turn is not a
+            // transient hiccup, it is this machine telling us the persistent
+            // transport does not work here. Retry THIS turn one-shot and stay
+            // there: the alternative is failing every wake forever, which is the
+            // shape the codex sandbox outage took.
+            // No usage means the model never ran — the process died in the
+            // transport, not mid-answer, so re-running the turn cannot duplicate
+            // work or double-charge.
+            if (result.error && !result.usage && !session.alive) {
+              this.persistentUnusable = true
+              this.engineSession = null
+              this.logEngineLine(`[engine] persistent session failed to produce a turn (${result.error.slice(0, 160)}) — falling back to one-shot for the rest of this process`)
+              result = await this.trackEngineRun(this.adapter.run({
+                home: this.home,
+                prompt: this.turnPrompt(null, delta),
+                env: this.engineEnv(),
+                model: this.engineModel(),
+                fastModel: this.engineFastModel(),
+                resumeSessionId,
+                onLog: (line) => this.logEngineLine(line),
+                onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
+                signal: this.teardown.signal,
+              }))
+              if (result.sessionId) this.setSessionId(result.sessionId)
+            }
           } else {
             // One-shot path: Cursor/OpenCode, Codex fallback, or a custom args override.
             result = await this.trackEngineRun(this.adapter.run({
