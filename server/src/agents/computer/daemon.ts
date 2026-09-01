@@ -225,6 +225,25 @@ const TRIAGE_CONCURRENCY = Math.max(1, Number(process.env.CUMORA_BYOA_MAX_CONCUR
 // — that's where the 130 rate-limit log lines came from. A 60s cooldown
 // lets the provider's short-window limit reset before we try again.
 const ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS = 60_000
+/** Cooldown after an engine failure only the OPERATOR can clear — a signed-out
+ *  CLI, an exhausted credit balance. Far longer than the rate-limit window,
+ *  because retrying changes nothing until a human logs in or tops up.
+ *
+ *  Measured before this existed: nine computers with a signed-out Claude
+ *  produced 1,988 failed turns in forty minutes — about one every twelve
+ *  seconds each, forever, with no backoff and nothing telling their operator
+ *  why. That is most of what a fleet-wide "97% failure rate" actually was. */
+const ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS = 15 * 60_000
+
+/** Engine failures that will recur identically until a human intervenes.
+ *  Deliberately narrow: only errors whose remedy is unambiguous and whose
+ *  retry has no chance of succeeding. Anything uncertain stays on the normal
+ *  path and keeps retrying. */
+const OPERATOR_FIX_RE = /not logged in|please run \/login|credit balance is too low|insufficient (credit|quota)|invalid api key|unauthorized/i
+
+export function needsOperatorFix(err: string | null | undefined): boolean {
+  return !!err && OPERATOR_FIX_RE.test(err)
+}
 // Neutral cwd for LOCAL small-brain triage: no persona CLAUDE.md / skills / MCP,
 // so the cerebellum completion is fast and tool-free.
 const TRIAGE_DIR = join(CONFIG_DIR, 'triage')
@@ -2892,6 +2911,14 @@ class AgentRunner {
         // what is really a transient provider throttle. Persist a quieter
         // signal to the run row instead so it shows up in observability.
         const rateLimited = engineError ? isRateLimited(engineError) : false
+        // An engine nobody has logged into will fail the same way on the next
+        // poll, and the one after that. Cool down like a rate limit so the
+        // machine stops spinning, but tell the user — a silent backoff on a
+        // fixable problem is just a slower way of never working.
+        if (engineError && !rateLimited && needsOperatorFix(engineError)) {
+          this.engineBackoffUntil = Date.now() + ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS
+          console.warn(`[computer] ${this.agent.id} engine needs operator action — pausing ${Math.round(ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS / 60000)}min: ${engineError.slice(0, 160)}`)
+        }
         if (engineError && !rateLimited) {
           await this.publishEngineFailure({
             token,
