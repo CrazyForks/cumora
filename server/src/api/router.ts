@@ -38,6 +38,7 @@ import {
   cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
   setComputerDefaultEngine,
 } from '../agents/computer/registry.js'
+import { attachComputerControlStream, deliverEngineDetect } from '../agents/computer/control-bus.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
 
@@ -156,13 +157,16 @@ function userId(req: Request & AuthedRequest): string {
   return requireAuth(req)
 }
 
+function deviceBearerToken(req: Request): string {
+  const auth = req.headers.authorization
+  return typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+}
+
 /** Resolve the calling Computer daemon from its device-token Bearer header,
  *  or throw 401. Used by daemon-facing endpoints that carry no user session —
  *  the device token (issued at pairing) is the credential. */
 async function requireDevice(req: Request & AuthedRequest): Promise<{ computerId: string; companyId: string }> {
-  const auth = req.headers.authorization
-  const token = typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
-  const dev = await resolveDevice(token)
+  const dev = await resolveDevice(deviceBearerToken(req))
   if (!dev) throw new HttpError(401, 'invalid or revoked device token')
   return dev
 }
@@ -1240,9 +1244,18 @@ api.post('/computers/pair', safe(async (req, res) => {
 
 api.post('/computers/:id/detect', safe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
-  const ok = await requestEngineDetect({ computerId: String(req.params.id), companyId })
+  const computerId = String(req.params.id)
+  // Persist first: Redis/SSE is the fast path, while the existing heartbeat flag
+  // guarantees eventual delivery across deploys, disconnects and Redis outages.
+  const ok = await requestEngineDetect({ computerId, companyId })
   if (!ok) throw new HttpError(404, 'computer not found')
-  res.json({ ok: true })
+  let delivered = false
+  try {
+    delivered = (await deliverEngineDetect(computerId)) > 0
+  } catch (error) {
+    console.warn('[computers] immediate engine detection signal failed:', error instanceof Error ? error.message : String(error))
+  }
+  res.json({ ok: true, delivered })
 }))
 
 api.post('/computers/:id/default-engine', safe(async (req, res) => {
@@ -1261,6 +1274,16 @@ api.post('/computers/me/engines', safe(async (req, res) => {
   const ok = await reportDetectedEngines({ computerId, engines, detected: req.body?.detected })
   if (!ok) throw new HttpError(404, 'computer not found')
   res.json({ ok: true })
+}))
+
+// One device-level control stream per daemon. Unlike per-agent wake streams,
+// this also works when the computer currently hosts zero agents.
+api.get('/computers/me/control-stream', safe(async (req, res) => {
+  const token = deviceBearerToken(req)
+  const { computerId } = await requireDevice(req)
+  await attachComputerControlStream(computerId, res, {
+    authorize: async () => (await resolveDevice(token))?.computerId === computerId,
+  })
 }))
 
 // Agents assigned to the calling computer (daemon discovery on boot).

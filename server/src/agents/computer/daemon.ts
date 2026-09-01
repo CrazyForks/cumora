@@ -37,6 +37,7 @@ import {
   uniqueProjectIds,
 } from '../memory-scope.js'
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
+import { parseComputerControlEvent } from './control-event.js'
 import {
   mergeWakeBackgroundBriefs,
   parseWakeData,
@@ -48,6 +49,33 @@ import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, snapshotDetectedEngines } from './engine.js'
 
 export { conversationHeader }
+
+/** Serialize engine scans and coalesce duplicate requests. A forced refresh that
+ * arrives during an ordinary scan schedules exactly one follow-up forced report,
+ * so the UI acknowledgement cannot be swallowed by older work. */
+export function createEngineRescanQueue(
+  scan: (forceReport: boolean) => Promise<void>,
+): (forceReport?: boolean) => Promise<void> {
+  let inFlight: Promise<void> | null = null
+  let forcedPending = false
+  return (forceReport = false): Promise<void> => {
+    forcedPending ||= forceReport
+    if (inFlight) return inFlight
+    const running = (async () => {
+      let first = true
+      while (first || forcedPending) {
+        first = false
+        const force = forcedPending
+        forcedPending = false
+        await scan(force)
+      }
+    })().finally(() => {
+      if (inFlight === running) inFlight = null
+    })
+    inFlight = running
+    return running
+  }
+}
 
 const CONFIG_DIR = join(homedir(), '.cumora')
 const CONFIG_PATH = join(CONFIG_DIR, 'computer.json')
@@ -3120,25 +3148,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   // Timer/startup/requested scans can land together. Share an in-flight scan;
   // if a forced request arrives during it, run once more so its acknowledgement
   // cannot be swallowed by the older scan finishing afterward.
-  let rescanInFlight: Promise<void> | null = null
-  let forcedRescanPending = false
-  const rescanEngines = (forceReport = false): Promise<void> => {
-    forcedRescanPending ||= forceReport
-    if (rescanInFlight) return rescanInFlight
-    const running = (async () => {
-      let first = true
-      while (first || forcedRescanPending) {
-        first = false
-        const force = forcedRescanPending
-        forcedRescanPending = false
-        await scanEnginesOnce(force)
-      }
-    })().finally(() => {
-      if (rescanInFlight === running) rescanInFlight = null
-    })
-    rescanInFlight = running
-    return running
-  }
+  const rescanEngines = createEngineRescanQueue(scanEnginesOnce)
 
   const heartbeat = async (): Promise<void> => {
     try {
@@ -3159,6 +3169,44 @@ async function doRun(serverOverride?: string): Promise<void> {
     } catch { /* transient — next tick retries */ }
   }
 
+  let shuttingDown = false
+  const controlStreamAbort = new AbortController()
+  const controlStreamLoop = async (): Promise<void> => {
+    let backoff = 1000
+    while (!shuttingDown) {
+      let connectedAt: number | null = null
+      try {
+        const response = await fetch(`${cfg.serverUrl}/api/computers/me/control-stream`, {
+          headers: { Authorization: `Bearer ${cfg.deviceToken}`, Accept: 'text/event-stream' },
+          signal: controlStreamAbort.signal,
+        })
+        if (!response.ok || !response.body) throw new Error(`computer control-stream HTTP ${response.status}`)
+        connectedAt = Date.now()
+        console.log('[computer] control-stream connected')
+        for await (const event of parseSseStream(response.body as unknown as AsyncIterable<unknown>)) {
+          if (shuttingDown) break
+          if (event.event === 'ready') {
+            // Pick up a durable request that may have been persisted while this
+            // stream was disconnected, without waiting for the next 30s tick.
+            void heartbeat()
+            continue
+          }
+          if (event.event === 'engine.detect' && event.data && parseComputerControlEvent(event.data)) {
+            void rescanEngines(true)
+          }
+        }
+        if (!shuttingDown) console.warn(`[computer] control-stream closed by server · retry in ${backoff}ms`)
+      } catch (error) {
+        if (shuttingDown || controlStreamAbort.signal.aborted) break
+        console.warn(`[computer] control-stream error: ${error instanceof Error ? error.message : String(error)} · retry in ${backoff}ms`)
+      }
+      if (shuttingDown) break
+      if (wakeStreamWasStable(connectedAt === null ? null : Date.now() - connectedAt)) backoff = 1000
+      await new Promise((resolve) => setTimeout(resolve, backoff))
+      backoff = Math.min(backoff * 2, 30_000)
+    }
+  }
+
   await heartbeat()
   await sync()
   if (runners.size === 0) {
@@ -3172,6 +3220,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   // on CLI spawns. Fill in the versions right after startup instead of leaving
   // the card blank until the first 5-minute tick.
   void rescanEngines()
+  void controlStreamLoop()
   // Keep the service log from filling the disk: rotate at boot, then periodically.
   void rotateLogsIfNeeded()
   const logrot = setInterval(() => { void rotateLogsIfNeeded() }, LOG_ROTATE_MS)
@@ -3180,7 +3229,6 @@ async function doRun(serverOverride?: string): Promise<void> {
   let upd: ReturnType<typeof setInterval> | undefined
   let idleWatch: ReturnType<typeof setInterval> | undefined
   let controlWatch: ReturnType<typeof setInterval> | undefined
-  let shuttingDown = false
   const anyBusy = (): boolean => [...runners.values()].some((r) => r.isBusy)
 
   // Graceful shutdown: stop accepting new wakes, give any in-flight turn a brief
@@ -3190,6 +3238,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   const shutdown = async (why: string): Promise<void> => {
     if (shuttingDown) return
     shuttingDown = true
+    controlStreamAbort.abort()
     clearInterval(poll); clearInterval(beat); clearInterval(logrot); clearInterval(rescan)
     if (upd) clearInterval(upd)
     if (idleWatch) clearInterval(idleWatch)
