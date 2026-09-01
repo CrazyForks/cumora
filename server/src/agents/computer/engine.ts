@@ -1669,7 +1669,20 @@ function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, rea
     // Untrusted projects skip project-local config, hooks, and rules. This is a
     // CLI override (highest precedence), so a model cannot plant a more
     // privileged .codex layer for the next one-shot wake.
-    '-c', `projects.${tomlString(args.home)}.trust_level="untrusted"`,
+    //
+    // Written as an inline table rather than the dotted `projects."<home>".…`
+    // form, because Codex 0.150/0.151 rejects a quoted dynamic map key in a
+    // dotted override under --strict-config and refuses to start at all:
+    //   Error loading config.toml: unknown configuration field
+    //     `projects."<agent-home>"` in -c/--config override
+    // Every wake then failed before the model ran, and the undelivered message
+    // stayed durable, so the daemon retried the same failure forever (#144).
+    //
+    // The inline form parses on every version anyone has checked — 0.134.0 and
+    // 0.152.0 here, 0.150.1 and 0.151.0-alpha on the report — whereas the
+    // dotted form does not, so this is the strictly better-supported spelling
+    // rather than a trade.
+    '-c', `projects={${tomlString(args.home)}={trust_level="untrusted"}}`,
     ...codexToolEnvironmentArgs(args),
   ]
   if (!readOnly) {
