@@ -397,12 +397,19 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.equal(runCapture.argv?.some((arg) => arg.includes(`${join(root, 'private-ipc', 'responses')}"="write`)), false)
   assert.ok(runCapture.argv?.includes('web_search="disabled"'))
   assert.ok(runCapture.argv?.includes('features.hooks=false'))
-  // Never send `projects.<path>.trust_level`: codex has no such configuration
-  // field and rejects the whole invocation over it — 78,445 failed turns in six
-  // hours across 103 workspaces, on every codex version and both platforms.
-  // This assertion used to REQUIRE the flag; it pinned an override that had
-  // never been run against a real codex.
-  assert.equal(runCapture.argv?.some((arg) => arg.startsWith('projects.')), false)
+  // Assert the INTENT — this home is marked untrusted — not one spelling of it.
+  // The dotted `projects."<home>".trust_level=…` form used to be here and had
+  // to change because Codex 0.150/0.151 refuses to start on it under
+  // --strict-config (#144); pinning the exact string is what would make the
+  // next necessary rewrite look like a regression.
+  const trustArg = runCapture.argv?.find((arg) => arg.startsWith('projects='))
+  assert.ok(trustArg, `no projects override in argv: ${JSON.stringify(runCapture.argv)}`)
+  assert.ok(trustArg.includes(JSON.stringify(home)), 'the override must name this agent home')
+  assert.ok(trustArg.includes('trust_level="untrusted"'), 'the agent home must be untrusted')
+  assert.equal(
+    runCapture.argv?.some((arg) => arg.startsWith('projects.')), false,
+    'the dotted form is rejected on POSIX by every codex version measured, 0.152.0 included',
+  )
   assert.ok(runCapture.argv?.some((arg) =>
     arg.startsWith('mcp_servers.cumora={')
       && arg.includes(`command=${JSON.stringify(process.execPath)}`)

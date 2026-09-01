@@ -1698,15 +1698,30 @@ function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, rea
     '-c', 'features.remote_plugin=false',
     '-c', 'features.multi_agent=false',
     '-c', 'features.shell_snapshot=false',
-    // NOTE: a `projects.<path>.trust_level="untrusted"` override used to sit
-    // here. Codex has no such configuration field and rejected the entire
-    // invocation over it — `unknown configuration field \`projects."…"\`` — on
-    // every version seen in the field (0.139 through 0.151) and on both
-    // platforms: 78,445 failed turns in six hours across 103 workspaces, 84% of
-    // all codex failures. Because it aborted codex before startup it never
-    // restricted anything, so removing it gives up no protection that was ever
-    // in effect; `exec --ignore-user-config --ignore-rules` below already
-    // excludes project-local config, hooks and rules.
+    // Untrusted projects skip project-local config, hooks, and rules. This is a
+    // CLI override (highest precedence), so a model cannot plant a more
+    // privileged .codex layer for the next one-shot wake.
+    //
+    // Written as an inline table rather than the dotted `projects."<home>".…`
+    // form, because Codex 0.150/0.151 rejects a quoted dynamic map key in a
+    // dotted override under --strict-config and refuses to start at all:
+    //   Error loading config.toml: unknown configuration field
+    //     `projects."<agent-home>"` in -c/--config override
+    // Every wake then failed before the model ran, and the undelivered message
+    // stayed durable, so the daemon retried the same failure forever (#144).
+    //
+    // The inline form parses on every version anyone has checked — 0.134.0 and
+    // 0.152.0 here, 0.150.1 and 0.151.0-alpha on the report — whereas the
+    // dotted form does not, so this is the strictly better-supported spelling
+    // rather than a trade.
+    //
+    // Production since corrected one guess above: the dotted form was NOT fixed
+    // after 0.151. In 30 hours it was rejected 252,589 times on POSIX across 121
+    // computers, including 35,721 on 0.151.0 (18 machines) and 13,153 on 0.152.0
+    // (12 machines). POSIX has no shell in this path and so no quote-stripping,
+    // which is what rules out the Windows cmd.exe cause and leaves the spelling
+    // itself. Do not restore the dotted form on the strength of a local check.
+    '-c', `projects={${tomlString(args.home)}={trust_level="untrusted"}}`,
     ...codexToolEnvironmentArgs(args),
   ]
   if (!readOnly) {
