@@ -286,7 +286,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           <Field
             label={isByoa ? t('agent.modelLabelByoa') : t('agent.modelLabel')}
             hint={isByoa
-              ? `${t('agent.modelHintByoaPrefix')} ${selectedEngineId === 'codex' ? t('agent.modelHintByoaCodex') : selectedEngineId === 'grok' ? t('agent.modelHintByoaGrok') : selectedEngineId === 'cursor' ? t('agent.modelHintByoaCursor') : selectedEngineId === 'opencode' ? t('agent.modelHintByoaOpenCode') : selectedEngineId === 'pi' ? t('agent.modelHintByoaPi') : t('agent.modelHintByoaClaude')} ${t('agent.modelHintByoaSuffix')}`
+              ? `${t('agent.modelHintByoaPrefix')} ${selectedEngineId === 'codex' ? t('agent.modelHintByoaCodex') : selectedEngineId === 'grok' ? t('agent.modelHintByoaGrok') : selectedEngineId === 'cursor' ? t('agent.modelHintByoaCursor') : selectedEngineId === 'opencode' ? t('agent.modelHintByoaOpenCode') : selectedEngineId === 'pi' ? t('agent.modelHintByoaPi') : selectedEngineId === 'gemini' ? t('agent.modelHintByoaGemini') : selectedEngineId === 'qwen' ? t('agent.modelHintByoaQwen') : selectedEngineId === 'antigravity' ? t('agent.modelHintByoaAntigravity') : t('agent.modelHintByoaClaude')} ${t('agent.modelHintByoaSuffix')}`
               : t('agent.modelHintCloud')}
           >
             <Input
@@ -312,6 +312,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                       ? t('agent.fastHintByoaOpenCode')
                       : selectedEngineId === 'pi'
                         ? t('agent.fastHintByoaPi')
+                        : selectedEngineId === 'gemini'
+                          ? t('agent.fastHintByoaGemini')
+                          : selectedEngineId === 'qwen'
+                            ? t('agent.fastHintByoaQwen')
+                            : selectedEngineId === 'antigravity'
+                              ? t('agent.fastHintByoaAntigravity')
                         : t('agent.fastHintByoaClaude')}
             >
               <Input

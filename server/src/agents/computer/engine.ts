@@ -3,7 +3,7 @@
  *
  * A BYOA agent's reasoning loop is delegated to a local CLI engine running
  * on the user's machine: Claude Code, Codex, Grok Build, Cursor Agent,
- * OpenCode, or pi. The daemon (daemon.ts) hands
+ * OpenCode, pi, Gemini CLI, Qwen Code, or Antigravity. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
  * dedicated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
@@ -349,10 +349,10 @@ function resolveCodexSpawn(): CodexSpawn {
   return { command: node, argsPrefix: [script], shell: false, wantsStdinPrompt: false }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -4647,6 +4647,410 @@ class QwenAdapter implements EngineAdapter {
   // fresh one, which is what the one-shot path already does.
 }
 
+// ─── Antigravity CLI ──────────────────────────────────────────────────────────────────
+//
+// `agy --input-format stream-json --output-format stream-json` is a real
+// long-lived protocol: one NDJSON user event goes in per turn and exactly one
+// terminal result event comes back. Result usage is CUMULATIVE for the whole
+// process, so the tracker must subtract the previous total before handing a
+// turn to Cumora's ledger. Treating the result as per-turn silently bills the
+// first turn again on every later wake.
+
+interface AntigravityNativeUsage {
+  input_tokens?: number
+  output_tokens?: number
+  thinking_tokens?: number
+  cache_read_tokens?: number
+  total_tokens?: number
+}
+
+interface AntigravityEvent {
+  event?: string
+  conversation_id?: string
+  init?: { conversation_id?: string; model?: string }
+  step_update?: {
+    conversation_id?: string
+    step_index?: number
+    state?: string
+    step_type?: string
+    text_delta?: string
+    tool_info?: unknown
+  }
+  result?: {
+    conversation_id?: string
+    status?: string
+    response?: string
+    error?: string
+    duration_seconds?: number
+    num_turns?: number
+    model?: string
+    usage?: AntigravityNativeUsage
+  }
+}
+
+function antigravityCounter(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+}
+
+/** Convert Antigravity's counters without charging cache reads twice.
+ *
+ * `input_tokens` is the complete prompt, including cache reads (the documented
+ * examples satisfy total = input + output). Cumora's common shape wants fresh
+ * input and cache reads in disjoint fields. `thinking_tokens` is a subset of
+ * output_tokens, not an extra token class, so it is intentionally not added
+ * again. */
+function antigravityUsage(raw: AntigravityNativeUsage | undefined): EngineUsage | undefined {
+  if (!raw) return undefined
+  const cached = antigravityCounter(raw.cache_read_tokens)
+  const input = Math.max(0, antigravityCounter(raw.input_tokens) - cached)
+  const output = antigravityCounter(raw.output_tokens)
+  if (!input && !output && !cached) return undefined
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_input_tokens: cached,
+  }
+}
+
+function antigravityUsageDelta(
+  current: AntigravityNativeUsage | undefined,
+  previous: AntigravityNativeUsage | undefined,
+): AntigravityNativeUsage | undefined {
+  if (!current) return undefined
+  const delta = (key: keyof AntigravityNativeUsage): number => {
+    const now = antigravityCounter(current[key])
+    const before = antigravityCounter(previous?.[key])
+    // A CLI-side session reset makes the cumulative total smaller. That new
+    // value is the whole current turn, not a negative delta.
+    return now >= before ? now - before : now
+  }
+  return {
+    input_tokens: delta('input_tokens'),
+    output_tokens: delta('output_tokens'),
+    thinking_tokens: delta('thinking_tokens'),
+    cache_read_tokens: delta('cache_read_tokens'),
+    total_tokens: delta('total_tokens'),
+  }
+}
+
+function parseAntigravityLine(line: string): AntigravityEvent | null {
+  if (!line.startsWith('{')) return null
+  try { return JSON.parse(line) as AntigravityEvent } catch { return null }
+}
+
+class AntigravityTurnTracker {
+  sessionId: string | null = null
+  model: string | null
+  text = ''
+  error: string | null = null
+  usage: EngineUsage | undefined
+  private previousUsage: AntigravityNativeUsage | undefined
+  private startedAt: number | null = null
+  private toolUses = 0
+  private readonly seenToolSteps = new Set<number>()
+  private hopIndex = 0
+
+  constructor(
+    pin: string | null,
+    private readonly onHopUsage?: (report: EngineHopReport) => void,
+  ) {
+    this.model = pin
+  }
+
+  beginTurn(): void {
+    this.text = ''
+    this.error = null
+    this.usage = undefined
+    this.startedAt = Date.now()
+    this.toolUses = 0
+    this.seenToolSteps.clear()
+  }
+
+  /** Feed one event. True means the current turn reached its terminal result. */
+  observe(event: AntigravityEvent): boolean {
+    const id = event.conversation_id ?? event.init?.conversation_id ?? event.result?.conversation_id
+    if (typeof id === 'string' && id) this.sessionId = id
+    const namedModel = event.init?.model ?? event.result?.model
+    if (typeof namedModel === 'string' && namedModel) this.model = namedModel
+
+    if (event.event === 'step_update') {
+      const step = event.step_update
+      if (step?.tool_info != null && step.state === 'DONE' && typeof step.step_index === 'number' && !this.seenToolSteps.has(step.step_index)) {
+        this.seenToolSteps.add(step.step_index)
+        this.toolUses += 1
+      }
+      return false
+    }
+    if (event.event !== 'result' || !event.result) return false
+
+    const result = event.result
+    if (typeof result.response === 'string') this.text = result.response
+    if (result.status !== 'SUCCESS') {
+      this.error = typeof result.error === 'string' && result.error
+        ? result.error
+        : `antigravity turn ended with status ${result.status || 'UNKNOWN'}`
+    }
+    const delta = antigravityUsageDelta(result.usage, this.previousUsage)
+    this.previousUsage = result.usage
+    this.usage = antigravityUsage(delta)
+    if (this.usage && this.onHopUsage) {
+      this.hopIndex += 1
+      try {
+        this.onHopUsage({
+          model: this.model ?? 'antigravity',
+          usage: this.usage,
+          latencyMs: this.startedAt == null ? undefined : Date.now() - this.startedAt,
+          hopIndex: this.hopIndex,
+          toolUses: this.toolUses,
+          textChars: this.text.length,
+        })
+      } catch { /* ledger reporting is best-effort */ }
+    }
+    return true
+  }
+}
+
+class AntigravitySession implements EngineSession {
+  private readonly child: ChildProcess
+  private readonly tracker: AntigravityTurnTracker
+  private readonly decoder = new StringDecoder('utf8')
+  private outBuf = ''
+  private exited = false
+  private exitCode = 0
+  private stderrTail: string[] = []
+  private stdoutTail: string[] = []
+  private pending: { resolve: (result: EngineRunResult) => void } | null = null
+  private stopPromise: Promise<void> | null = null
+  readonly carriesStandingPrompt = false
+
+  constructor(
+    command: string,
+    argv: string[],
+    shell: boolean,
+    private readonly opts: EngineSessionArgs,
+    pin: string | null,
+  ) {
+    this.tracker = new AntigravityTurnTracker(pin, opts.onHopUsage)
+    this.child = spawnEngineChild(command, argv, {
+      cwd: opts.home,
+      env: opts.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell,
+    })
+    this.child.stdout?.on('data', (buf: Buffer) => this.onStdout(buf))
+    this.child.stderr?.on('data', (buf: Buffer) => this.onStderr(buf))
+    this.child.on('error', (err) => this.die(1, err.message))
+    this.child.on('close', (code, signalName) => {
+      this.flushStdout()
+      this.die(code ?? (signalName ? 128 : 1), signalName ? `terminated by ${signalName}` : `exited with code ${code}`)
+    })
+  }
+
+  get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
+  get sessionId(): string | null { return this.tracker.sessionId }
+  get text(): string { return this.tracker.text }
+
+  send(prompt: string): Promise<EngineRunResult> {
+    if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sessionId })
+    if (!this.alive) {
+      return Promise.resolve({
+        exitCode: this.exitCode || 1,
+        error: failurePreview({ exitCode: this.exitCode || 1, signalName: null, stderr: this.stderrTail, stdout: this.stdoutTail }),
+        sessionId: this.sessionId,
+      })
+    }
+    this.tracker.beginTurn()
+    return new Promise((resolve) => {
+      this.pending = { resolve }
+      const message = JSON.stringify({ event: 'user', message: { content: stripLoneSurrogates(prompt) } })
+      if (!writeStdin(this.child, `${message}\n`)) {
+        this.settle({ exitCode: 1, error: 'failed to write turn to antigravity', sessionId: this.sessionId })
+      }
+    })
+  }
+
+  steer(_text: string): void {
+    // The documented protocol requires waiting for a result before the next
+    // user event. Queueing mid-turn would be an undocumented race; the daemon's
+    // normal coalesced wake delivers the ping after this turn instead.
+    if (this.pending) this.opts.onLog('[antigravity] same-turn steer is not supported; the ping rides the next wake')
+  }
+
+  stop(options: { force?: boolean } = {}): Promise<void> {
+    this.exited = true
+    try { this.child.stdin?.end() } catch { /* ignore */ }
+    if (options.force) return terminateEngineTree(this.child, true)
+    if (!this.stopPromise) {
+      this.stopPromise = (async () => {
+        if (await waitForChildExit(this.child, 2_000)) return
+        await terminateEngineTree(this.child)
+      })()
+    }
+    return this.stopPromise
+  }
+
+  private onStdout(buf: Buffer): void {
+    this.outBuf += this.decoder.write(buf)
+    let newline: number
+    while ((newline = this.outBuf.indexOf('\n')) >= 0) {
+      const raw = this.outBuf.slice(0, newline)
+      this.outBuf = this.outBuf.slice(newline + 1)
+      this.takeLine(raw)
+    }
+  }
+
+  private flushStdout(): void {
+    this.outBuf += this.decoder.end()
+    if (this.outBuf) this.takeLine(this.outBuf)
+    this.outBuf = ''
+  }
+
+  private takeLine(raw: string): void {
+    const line = cleanLine(raw)
+    if (!line) return
+    pushTail(this.stdoutTail, line)
+    this.opts.onLog(line)
+    const event = parseAntigravityLine(line)
+    if (event && this.tracker.observe(event)) {
+      const eventError = this.tracker.error
+      this.settle({
+        exitCode: eventError ? 1 : 0,
+        error: eventError ? `engine turn error: ${eventError.slice(0, MAX_FAILURE_CHARS)}` : undefined,
+        sessionId: this.tracker.sessionId,
+        usage: this.tracker.usage,
+        model: this.tracker.model,
+      })
+    }
+  }
+
+  private onStderr(buf: Buffer): void {
+    for (const raw of buf.toString('utf8').split('\n')) {
+      const line = cleanLine(raw)
+      if (!line) continue
+      pushTail(this.stderrTail, line)
+      this.opts.onLog(line)
+    }
+  }
+
+  private settle(result: EngineRunResult): void {
+    const pending = this.pending
+    if (!pending) return
+    this.pending = null
+    pending.resolve(result)
+  }
+
+  private die(code: number, detail: string): void {
+    if (this.exited && !this.pending) return
+    this.exited = true
+    this.exitCode = code
+    if (this.pending) {
+      this.settle({
+        exitCode: code || 1,
+        error: failurePreview({ exitCode: code || 1, signalName: null, stderr: this.stderrTail, stdout: this.stdoutTail }) || detail,
+        sessionId: this.sessionId,
+        usage: this.tracker.usage,
+        model: this.tracker.model,
+      })
+    }
+  }
+}
+
+class AntigravityAdapter implements EngineAdapter {
+  readonly id = 'antigravity' as const
+  readonly bin = 'agy'
+
+  private sessionArgs(args: EngineSessionArgs, mode: 'accept-edits' | 'plan'): string[] {
+    const model = args.model ? ['--model', args.model] : []
+    return [
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json',
+      '--sandbox',
+      '--mode', mode,
+      '--dangerously-skip-permissions',
+      '--disable-slash-commands',
+      ...model,
+    ]
+  }
+
+  private start(args: EngineSessionArgs, mode: 'accept-edits' | 'plan'): AntigravitySession {
+    const { command, shell } = resolveSpawn(this.bin)
+    // Do not pass --conversation across daemon restarts yet. Its result usage is
+    // cumulative over the historical conversation, while Cumora persists only
+    // the id, not the prior counters; resuming would overbill that history as
+    // the first new turn. The per-agent home + memory remains durable.
+    return new AntigravitySession(command, this.sessionArgs(args, mode), shell, args, args.model ?? null)
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    return this.start(args, 'accept-edits')
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    if (args.signal.aborted) return { exitCode: 130, error: 'engine turn aborted before start', sessionId: null }
+    const sessionArgs: EngineSessionArgs = {
+      home: args.home,
+      env: args.env,
+      model: args.model,
+      fastModel: args.fastModel,
+      resumeSessionId: args.resumeSessionId,
+      onLog: args.onLog,
+      onHopUsage: args.onHopUsage,
+    }
+    const session = this.start(sessionArgs, 'accept-edits')
+    const onAbort = (): void => { void session.stop({ force: true }) }
+    args.signal.addEventListener('abort', onAbort, { once: true })
+    if (args.signal.aborted) onAbort()
+    try {
+      if (args.signal.aborted) return { exitCode: 130, error: 'engine turn aborted before start', sessionId: null }
+      return await session.send(args.prompt)
+    } finally {
+      args.signal.removeEventListener('abort', onAbort)
+      await session.stop()
+    }
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const session = this.start({
+      home: args.cwd,
+      env: args.env,
+      model: args.model ?? process.env.CUMORA_TRIAGE_MODEL ?? null,
+      onLog: args.onLog ?? (() => {}),
+    }, 'plan')
+    const onAbort = (): void => { void session.stop({ force: true }) }
+    args.signal.addEventListener('abort', onAbort, { once: true })
+    if (args.signal.aborted) onAbort()
+    try {
+      if (args.signal.aborted) return { text: '', error: 'engine turn aborted before start' }
+      const result = await session.send(args.prompt)
+      return { text: session.text, error: result.error, usage: result.usage, model: result.model }
+    } finally {
+      args.signal.removeEventListener('abort', onAbort)
+      await session.stop()
+    }
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    const model = args.tier === 'small' ? (process.env.CUMORA_TRIAGE_MODEL ?? null) : null
+    return this.classify({ cwd: args.cwd, prompt: DOCTOR_PROMPT, env: args.env, model, signal: args.signal })
+  }
+
+  probeWake(_args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // classify()/probe() use the same bidirectional stream-json protocol as a
+    // real wake, only in plan mode, so the brain probes already cover it.
+    return Promise.resolve({ ok: true, detail: '', skipped: true })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.agents', 'skills'), { recursive: true })
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.agents/skills/' }),
+      'utf8',
+    )
+  }
+}
+
 
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
@@ -4657,6 +5061,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   pi: new PiAdapter(),
   gemini: new GeminiAdapter(),
   qwen: new QwenAdapter(),
+  antigravity: new AntigravityAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {

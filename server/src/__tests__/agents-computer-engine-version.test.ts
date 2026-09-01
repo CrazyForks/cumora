@@ -96,6 +96,10 @@ test('inferUpdateCommand prefers the vendor updater, then brew, then npm', () =>
   // pi needs the vendor's documented flag when it falls through to npm.
   assert.equal(inferUpdateCommand({ versionArgs: ['--version'], npm: '@earendil-works/pi-coding-agent', npmFlags: '--ignore-scripts' }, '/usr/local/bin/pi'),
     'npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest')
+  assert.equal(
+    inferUpdateCommand(ENGINE_VERSION_SPECS.antigravity, '/Users/test/.local/bin/agy'),
+    'agy update',
+  )
 })
 
 test('parseCursorAbout / parseGrokCheck read their vendor formats', () => {

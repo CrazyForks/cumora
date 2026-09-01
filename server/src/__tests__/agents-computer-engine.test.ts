@@ -66,7 +66,7 @@ afterEach(async () => {
 })
 
 test('secure inventory exposes only engines with a verified boundary', () => {
-  const installed = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini'] as const
+  const installed = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity'] as const
   assert.deepEqual(runnableEngineIds(installed, {}, 'darwin'), ['claude', 'codex'])
   assert.deepEqual(runnableEngineIds(installed, {}, 'linux'), ['claude', 'codex'])
   assert.deepEqual(runnableEngineIds(installed, {}, 'win32'), ['codex'])

@@ -20,7 +20,7 @@ import { CH_STATUS, publish } from '../../redis.js'
 import { signAgentToken } from '../runtime/jwt.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -59,6 +59,7 @@ export async function announceComputerOnline(computerId: string, companyId: stri
 const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
   claude: true, codex: true, grok: true, cursor: true, opencode: true, pi: true, gemini: true,
   qwen: true,
+  antigravity: true,
 }
 const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
 
@@ -101,6 +102,8 @@ const ENGINE_BINS: Record<string, string> = {
   opencode: 'opencode',
   pi: 'pi',
   gemini: 'gemini',
+  qwen: 'qwen',
+  antigravity: 'agy',
 }
 
 /** Cached PATH snapshot from the daemon. The app reads this; it never probes. */
@@ -559,7 +562,8 @@ export async function mintAgentRuntimeToken(args: {
  *  When a row has no explicit model, fall back to the deploy-level default
  *  (CUMORA_DEFAULT_CLAUDE_MODEL / CUMORA_DEFAULT_CODEX_MODEL /
  *  CUMORA_DEFAULT_GROK_MODEL / CUMORA_DEFAULT_CURSOR_MODEL /
- *  CUMORA_DEFAULT_OPENCODE_MODEL / CUMORA_DEFAULT_PI_MODEL) so every BYOA
+ *  CUMORA_DEFAULT_OPENCODE_MODEL / CUMORA_DEFAULT_PI_MODEL /
+ *  CUMORA_DEFAULT_ANTIGRAVITY_MODEL) so every BYOA
  *  daemon gets a consistent pin — independent of whatever model the local
  *  engine CLI happens to default to today. Critical: a model
  *  upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently changes
@@ -579,6 +583,7 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const cursorDefault = process.env.CUMORA_DEFAULT_CURSOR_MODEL?.trim() || null
   const openCodeDefault = process.env.CUMORA_DEFAULT_OPENCODE_MODEL?.trim() || null
   const piDefault = process.env.CUMORA_DEFAULT_PI_MODEL?.trim() || null
+  const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   return rows.map((r) => {
     if (r.model) return r
     const dflt = r.engine === 'codex'
@@ -593,6 +598,8 @@ export async function listAgentsForComputer(computerId: string): Promise<
               ? openCodeDefault
               : r.engine === 'pi'
                 ? piDefault
+                : r.engine === 'antigravity'
+                  ? antigravityDefault
                 : null
     return dflt ? { ...r, model: dflt } : r
   })

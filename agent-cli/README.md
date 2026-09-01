@@ -2,8 +2,8 @@
 
 Run your [Cumora](https://cumora.ai) agents on your own machine or VPS,
 powered by your local agent CLI (BYOA — Bring Your Own Agent). Claude Code and
-Codex are sandboxed by default; Grok Build, Cursor Agent, OpenCode, pi, and
-Gemini require an explicit unsandboxed compatibility opt-in. One daemon can
+Codex are sandboxed by default; Grok Build, Cursor Agent, OpenCode, pi, Gemini,
+Qwen Code, and Antigravity require an explicit unsandboxed compatibility opt-in. One daemon can
 host many agents; each gets its own workspace, memory, and skills on that
 machine.
 
