@@ -1650,6 +1650,38 @@ function codexToolEnvironmentArgs(args: { home: string; env: NodeJS.ProcessEnv }
   return ['-c', `shell_environment_policy.set={${entries.join(',')}}`]
 }
 
+/** Codex rejects the whole invocation when any `-c` override fails to load, and
+ *  the resulting error names `config.toml` without ever mentioning that Cumora
+ *  authored that config — which is how 103 workspaces spent six hours looking at
+ *  agents that would not answer, with no way to reach the cause.
+ *
+ *  Say it once per daemon: name Cumora as the author, quote what codex actually
+ *  said so it can be reported upstream, and point at the documented escape
+ *  hatch. Deliberately does NOT downgrade on its own — the only fallback
+ *  available is the historical `--dangerously-bypass-approvals-and-sandbox`, and
+ *  trading the sandbox for availability is a maintainer's decision. */
+const CODEX_CONFIG_REJECTED_RE = /Error loading config\.toml|unknown configuration field|expected struct \w+PermissionsToml/i
+
+let codexProfileRejected = false
+
+export function codexProfileIsRejected(): boolean {
+  return codexProfileRejected
+}
+
+/** Test seam. */
+export function resetCodexProfileRejection(): void {
+  codexProfileRejected = false
+}
+
+export function noteCodexConfigRejection(err: string | undefined, onLog?: (line: string) => void): boolean {
+  if (!err || codexProfileRejected || !CODEX_CONFIG_REJECTED_RE.test(err)) return false
+  codexProfileRejected = true
+  const hint = `[codex] the installed codex rejected the sandbox profile Cumora passes via -c. Every turn on this machine fails until this is resolved. Set ${ALLOW_UNSANDBOXED_BYOA_ENV}=1 on the daemon to run with the historical unsandboxed flags, or report the codex version. Codex said: ${err.slice(0, 300)}`
+  onLog?.(hint)
+  console.warn(hint)
+  return true
+}
+
 function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
   const workspaceAccess = readOnly ? 'read' : 'write'
   const filesystemEntries = [
@@ -1666,10 +1698,15 @@ function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, rea
     '-c', 'features.remote_plugin=false',
     '-c', 'features.multi_agent=false',
     '-c', 'features.shell_snapshot=false',
-    // Untrusted projects skip project-local config, hooks, and rules. This is a
-    // CLI override (highest precedence), so a model cannot plant a more
-    // privileged .codex layer for the next one-shot wake.
-    '-c', `projects.${tomlString(args.home)}.trust_level="untrusted"`,
+    // NOTE: a `projects.<path>.trust_level="untrusted"` override used to sit
+    // here. Codex has no such configuration field and rejected the entire
+    // invocation over it — `unknown configuration field \`projects."…"\`` — on
+    // every version seen in the field (0.139 through 0.151) and on both
+    // platforms: 78,445 failed turns in six hours across 103 workspaces, 84% of
+    // all codex failures. Because it aborted codex before startup it never
+    // restricted anything, so removing it gives up no protection that was ever
+    // in effect; `exec --ignore-user-config --ignore-rules` below already
+    // excludes project-local config, hooks and rules.
     ...codexToolEnvironmentArgs(args),
   ]
   if (!readOnly) {
@@ -2120,6 +2157,12 @@ class CodexAdapter implements EngineAdapter {
     const model = args.model ? ['--model', args.model] : []
     const { command, shell, argsPrefix } = resolveCodexSpawn()
     return spawnEngine(command, [...argsPrefix, ...base, ...model, '-'], args, { shell, stdinText: args.prompt })
+      .then((res) => {
+        // A rejected -c override aborts codex before it reads the prompt, so the
+        // turn fails with a config error that never mentions Cumora. Say it once.
+        noteCodexConfigRejection(res.error, args.onLog)
+        return res
+      })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {

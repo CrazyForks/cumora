@@ -397,7 +397,12 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.equal(runCapture.argv?.some((arg) => arg.includes(`${join(root, 'private-ipc', 'responses')}"="write`)), false)
   assert.ok(runCapture.argv?.includes('web_search="disabled"'))
   assert.ok(runCapture.argv?.includes('features.hooks=false'))
-  assert.ok(runCapture.argv?.includes(`projects.${JSON.stringify(home)}.trust_level="untrusted"`))
+  // Never send `projects.<path>.trust_level`: codex has no such configuration
+  // field and rejects the whole invocation over it — 78,445 failed turns in six
+  // hours across 103 workspaces, on every codex version and both platforms.
+  // This assertion used to REQUIRE the flag; it pinned an override that had
+  // never been run against a real codex.
+  assert.equal(runCapture.argv?.some((arg) => arg.startsWith('projects.')), false)
   assert.ok(runCapture.argv?.some((arg) =>
     arg.startsWith('mcp_servers.cumora={')
       && arg.includes(`command=${JSON.stringify(process.execPath)}`)
