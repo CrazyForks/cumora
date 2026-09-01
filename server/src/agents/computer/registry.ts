@@ -116,6 +116,16 @@ export interface DetectedEngine {
   latest?: string | null
   outdated?: boolean
   updateCommand?: string | null
+  /** Why Cumora will not drive this engine even though it is installed here —
+   *  "version 2.0.9 is older than the secure minimum 2.1.248", "missing sandbox
+   *  dependency: bubblewrap (bwrap)". Absent when the engine is runnable.
+   *
+   *  This travels because the person reading the card is usually not sitting at
+   *  the machine it describes — the same reason the version fields do. The
+   *  daemon knew the reason all along and only wrote it to its own stdout, so
+   *  an engine could vanish from a computer with no explanation anywhere the
+   *  operator was looking. */
+  blockedReason?: string | null
 }
 
 /** Trim a daemon-reported display string, or drop it. Control characters are
@@ -145,12 +155,29 @@ function sanitizeVersionFields(rec: Record<string, unknown>): Partial<DetectedEn
 function unreportedEngine(id: string): DetectedEngine {
   return {
     id, bin: ENGINE_BINS[id] ?? id, path: null,
-    version: null, latest: null, outdated: false, updateCommand: null,
+    version: null, latest: null, outdated: false, updateCommand: null, blockedReason: null,
   }
 }
 
-export function sanitizeDetectedEngines(raw: unknown, engineIds: string[]): DetectedEngine[] {
-  const allowed = engineIds.filter((id) => PAIRABLE_ENGINES.has(id))
+/**
+ * Shape the daemon's PATH report for storage and display.
+ *
+ * `runnableIds` are the engines the daemon will actually wake; `blockedIds` are
+ * installed but refused, and appear ONLY here. That separation is the safety
+ * property of this function: `available_engines` is what picks an agent's
+ * adapter, so a blocked engine reaching it would run the very thing the
+ * sandbox gate declined. Blocked ids are therefore never returned to the
+ * caller as runnable and never influence `ordered` — they ride along as extra
+ * display rows carrying the reason they were refused.
+ */
+export function sanitizeDetectedEngines(
+  raw: unknown,
+  engineIds: string[],
+  blockedIds: string[] = [],
+): DetectedEngine[] {
+  const runnable = engineIds.filter((id) => PAIRABLE_ENGINES.has(id))
+  const blocked = blockedIds.filter((id) => PAIRABLE_ENGINES.has(id) && !runnable.includes(id))
+  const allowed = [...runnable, ...blocked]
   if (!Array.isArray(raw)) return allowed.map(unreportedEngine)
   const byId = new Map<string, DetectedEngine>()
   for (const item of raw) {
@@ -160,7 +187,10 @@ export function sanitizeDetectedEngines(raw: unknown, engineIds: string[]): Dete
     if (!PAIRABLE_ENGINES.has(id) || !allowed.includes(id)) continue
     const bin = typeof rec.bin === 'string' && rec.bin.trim() ? rec.bin.trim() : (ENGINE_BINS[id] ?? id)
     const path = typeof rec.path === 'string' && rec.path.trim() ? rec.path.trim() : null
-    byId.set(id, { id, bin, path, ...sanitizeVersionFields(rec) })
+    // A reason is only meaningful on an engine we actually refused. Accepting
+    // one on a runnable engine would let a daemon mark a working engine broken.
+    const blockedReason = blocked.includes(id) ? displayString(rec.blockedReason, 200) : null
+    byId.set(id, { id, bin, path, ...sanitizeVersionFields(rec), blockedReason })
   }
   // Every row carries the same keys, reported or not, so the app never has to
   // distinguish "field absent" from "nothing installed to report".
@@ -315,6 +345,11 @@ export async function pairComputer(args: {
   engines?: string[]
   /** Optional PATH snapshot from the daemon (bin + resolved path). */
   detected?: unknown
+  /** Installed engines the daemon refused to run, so the card can say why from
+   *  the very first pairing rather than only after the next PATH rescan — which
+   *  is minutes later, and right after pairing is exactly when "why is only
+   *  codex here?" gets asked. Display-only; never joins available_engines. */
+  blocked?: string[]
   /** The daemon's running version, stored so the app can flag outdated daemons. */
   version?: string
   /** Whether the daemon runs supervised (service) vs. as a foreground command. */
@@ -326,7 +361,8 @@ export async function pairComputer(args: {
   deferBroadcast?: boolean
 }): Promise<{ computerId: string; companyId: string; deviceToken: string } | null> {
   const engines = (args.engines ?? []).filter((e) => PAIRABLE_ENGINES.has(e))
-  const detected = sanitizeDetectedEngines(args.detected, engines)
+  const blocked = args.blocked ?? []
+  const detected = sanitizeDetectedEngines(args.detected, engines, blocked)
   const detectedJson = JSON.stringify(detected)
   const version = typeof args.version === 'string' && args.version ? args.version.slice(0, 32) : null
   const supervised = typeof args.supervised === 'boolean' ? args.supervised : null
@@ -346,7 +382,7 @@ export async function pairComputer(args: {
     // the existing default first while it is still installed; if it vanished,
     // mergeDetectedEngines naturally falls back to the daemon's scan order.
     const orderedEngines = mergeDetectedEngines(currentEngines ?? [], engines) ?? (currentEngines ?? [])
-    const reconnectDetectedJson = JSON.stringify(sanitizeDetectedEngines(args.detected, orderedEngines))
+    const reconnectDetectedJson = JSON.stringify(sanitizeDetectedEngines(args.detected, orderedEngines, blocked))
     await pool.query(
       `UPDATE computers
           SET credential_hash = $1, available_engines = $2::jsonb,
@@ -686,6 +722,9 @@ export async function reportDetectedEngines(args: {
   computerId: string
   engines?: string[]
   detected?: unknown
+  /** Installed engines the daemon refused to run. Display-only — they are
+   *  deliberately kept out of `available_engines`, which chooses adapters. */
+  blocked?: string[]
 }): Promise<boolean> {
   const { rows } = await pool.query<{ available_engines: string[]; company_id: string }>(
     `SELECT available_engines, company_id FROM computers
@@ -699,7 +738,7 @@ export async function reportDetectedEngines(args: {
   const ordered = prevDefault && incoming.includes(prevDefault)
     ? [prevDefault, ...incoming.filter((e) => e !== prevDefault)]
     : incoming
-  const detected = sanitizeDetectedEngines(args.detected, ordered)
+  const detected = sanitizeDetectedEngines(args.detected, ordered, args.blocked ?? [])
   await pool.query(
     `UPDATE computers
         SET available_engines = $2::jsonb,

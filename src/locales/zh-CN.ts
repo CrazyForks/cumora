@@ -1296,6 +1296,8 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'me.agentsIsDefault': '默认',
   'me.agentsOffline': '这台计算机离线。列表仍是上次配对时的检测结果。',
   'me.agentsNoEngines': '配对时 daemon 没有报任何引擎。要重新扫 PATH，请在那台机器上再跑一次配对命令。',
+  'me.agentsCliBlocked': '未启用',
+  'me.agentsCliBlockedReason': '已安装，但 Cumora 不会在这台机器上运行它：{reason}。在此修复前，这台计算机上的智能体无法使用它。',
   'me.agentsNotRunnable': '仅识别，Cumora 还不能当引擎跑',
   'me.agentsNeedPair': '重新配对后使用',
   'me.agentsCliUnknown': '版本未知',

@@ -30,6 +30,10 @@ export interface Computer {
     outdated?: boolean
     /** How to update this engine on that computer (vendor updater, brew, or npm). */
     updateCommand?: string | null
+    /** Set when the engine is installed there but Cumora refuses to drive it —
+     *  an old CLI, or a missing sandbox dependency. The daemon knows this and
+     *  now says so, instead of the engine merely going absent. */
+    blockedReason?: string | null
   }>
   enginesDetectedAt?: string | null
   lastSeenAt?: string | null

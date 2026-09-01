@@ -1186,6 +1186,11 @@ api.post('/computers/pair', safe(async (req, res) => {
     ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
     : []
   const detected = req.body?.detected
+  // Same separation as /computers/me/engines: display-only, never merged into
+  // the engines list that picks an adapter.
+  const blockedAtPair = Array.isArray(req.body?.blocked)
+    ? (req.body.blocked as unknown[]).filter((e): e is string => typeof e === 'string')
+    : []
   const hostName = typeof req.body?.hostName === 'string' ? req.body.hostName : undefined
   const version = typeof req.body?.version === 'string' ? req.body.version : undefined
   const supervised = typeof req.body?.supervised === 'boolean' ? req.body.supervised : undefined
@@ -1193,7 +1198,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   // its onboarding gate on that event and immediately reloads its roster, so the
   // starter team + "Everyone" group must already exist when it fires — otherwise
   // the user lands on an empty Conversations list that fills in a beat later.
-  const paired = await pairComputer({ code, hostName, engines, detected, version, supervised, deferBroadcast: true })
+  const paired = await pairComputer({ code, hostName, engines, detected, blocked: blockedAtPair, version, supervised, deferBroadcast: true })
   if (!paired) throw new HttpError(400, 'invalid pairing token')
   // Free-tier BYOA onboarding on pair. The daemon sends the engines list with
   // the user's CHOSEN engine first (`cumora agent computer --pair … --engine X`),
@@ -1258,7 +1263,13 @@ api.post('/computers/me/engines', safe(async (req, res) => {
   const engines = Array.isArray(req.body?.engines)
     ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
     : []
-  const ok = await reportDetectedEngines({ computerId, engines, detected: req.body?.detected })
+  // Installed-but-refused engines. Kept apart from `engines` on purpose: that
+  // list becomes available_engines and picks an agent's adapter, so a blocked
+  // id arriving there would run what the sandbox gate declined.
+  const blocked = Array.isArray(req.body?.blocked)
+    ? (req.body.blocked as unknown[]).filter((e): e is string => typeof e === 'string')
+    : []
+  const ok = await reportDetectedEngines({ computerId, engines, detected: req.body?.detected, blocked })
   if (!ok) throw new HttpError(404, 'computer not found')
   res.json({ ok: true })
 }))

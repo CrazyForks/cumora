@@ -46,7 +46,7 @@ import {
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
-import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, snapshotDetectedEngines } from './engine.js'
+import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 
 export { conversationHeader }
 
@@ -766,7 +766,27 @@ function helpText(): string {
   ].join('\n')
 }
 
-async function requireLocalEngine(): Promise<EngineId[]> {
+/** Snapshot rows for refused engines, each carrying the reason it was refused.
+ *  Reported alongside the runnable ones so the card can explain an absence;
+ *  they never enter the `engines` list, which is what picks an adapter. */
+async function blockedSnapshotRows(
+  blocked: RunnableEngineEvaluation['blocked'],
+): Promise<DetectedEngineSnapshot[]> {
+  const rows = await snapshotDetectedEngines(blocked.map(({ id }) => id))
+  return rows.map((row) => ({
+    ...row,
+    blockedReason: blocked.find(({ id }) => id === row.id)?.reason,
+  }))
+}
+
+/** The engines this machine can run, plus the ones it cannot and why.
+ *
+ *  The refusals used to stop at the console.warn below. Pairing then reported
+ *  only the runnable list, so a fresh computer's card said nothing about the
+ *  engine that was skipped until the first PATH rescan minutes later — which is
+ *  precisely the window in which someone asks why their Claude Code is not
+ *  listed. */
+async function requireLocalEngine(): Promise<RunnableEngineEvaluation> {
   const detected = await detectEnginesWithStatus()
   if (!detected.reliable) {
     throw new Error('could not scan PATH (`which` / `where` failed). Fix that, then retry pairing.')
@@ -780,7 +800,7 @@ async function requireLocalEngine(): Promise<EngineId[]> {
   if (evaluated.blocked.length > 0) {
     console.warn(`[computer] secure engine(s) disabled: ${evaluated.blocked.map(({ id, reason }) => `${id} (${reason})`).join('; ')}`)
   }
-  return evaluated.runnable
+  return evaluated
 }
 
 /** Resolve the engine a daemon can actually run from its LIVE PATH inventory. */
@@ -1268,7 +1288,8 @@ async function detectHostName(): Promise<string> {
 }
 
 async function doPair(code: string, serverUrl: string, preferredEngine?: string): Promise<void> {
-  const detected = await requireLocalEngine()
+  const evaluated = await requireLocalEngine()
+  const detected = evaluated.runnable
   // The chosen engine becomes this computer's DEFAULT — it's sent first in the
   // engines list, which the server stores as available_engines[0] and uses as
   // the engine for the starter team and any agent assigned here without an
@@ -1283,12 +1304,16 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
     }
     engines = [preferredEngine as EngineId, ...detected.filter((e) => e !== preferredEngine)]
   }
-  const snapshot = await snapshotDetectedEngines(engines)
+  const blockedIds = evaluated.blocked.map(({ id }) => id)
+  const snapshot = [
+    ...await snapshotDetectedEngines(engines),
+    ...await blockedSnapshotRows(evaluated.blocked),
+  ]
   const paired = await api<{ computerId: string; deviceToken: string }>(
     serverUrl, '/api/computers/pair',
     { method: 'POST', body: JSON.stringify({
       code, hostName: await detectHostName(), engines, detected: snapshot,
-      version: CURRENT_VERSION, supervised: SUPERVISED,
+      blocked: blockedIds, version: CURRENT_VERSION, supervised: SUPERVISED,
     }) },
   )
   await saveConfig({ serverUrl, computerId: paired.computerId, deviceToken: paired.deviceToken })
@@ -3046,7 +3071,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   if (serverOverride) cfg.serverUrl = serverOverride
   let initialEngines: EngineId[]
   try {
-    initialEngines = await requireLocalEngine()
+    initialEngines = (await requireLocalEngine()).runnable
   } catch (err) {
     console.error(`[computer] ${err instanceof Error ? err.message : String(err)}`)
     process.exitCode = 70
@@ -3160,17 +3185,31 @@ async function doRun(serverOverride?: string): Promise<void> {
       // engine's version *as installed on this machine*: the app renders it
       // verbatim and never probes its own PATH, because whoever is looking at
       // the card is usually not sitting at the machine it describes.
-      const snapshot = await enrichDetectedEngines(await snapshotDetectedEngines(next))
+      // Blocked engines ride along as extra display rows carrying the reason
+      // they were refused. Until now that reason existed only as the
+      // console.warn above — on a machine the operator is usually not sitting
+      // at — so an engine could disappear from the card with no explanation
+      // anywhere they could see. They stay OUT of `next`: that list becomes
+      // available_engines and picks an agent's adapter.
+      const blockedIds = evaluated.blocked.map(({ id }) => id)
+      // One enrich over the whole list: it maps entry-by-entry, so splitting it
+      // bought nothing and only risked the two halves drifting apart.
+      const snapshot = await enrichDetectedEngines([
+        ...await snapshotDetectedEngines(next),
+        ...await blockedSnapshotRows(evaluated.blocked),
+      ])
       // Report on version drift too, not just install/uninstall — upgrading an
       // engine in place leaves the engine *list* identical, and that is exactly
-      // when the card's version line goes stale.
+      // when the card's version line goes stale. The blocked reasons are part
+      // of the fingerprint: fixing the cause (upgrading the CLI, installing
+      // bwrap) has to clear the card, not wait for an unrelated change.
       const fingerprint = JSON.stringify(snapshot)
       if (shouldReportEngineSnapshot(fingerprint, lastEngineSnapshot, forceReport)) {
         lastEngineSnapshot = fingerprint
         await api(cfg.serverUrl, '/api/computers/me/engines', {
           method: 'POST',
           headers: { Authorization: `Bearer ${cfg.deviceToken}` },
-          body: JSON.stringify({ engines: next, detected: snapshot }),
+          body: JSON.stringify({ engines: next, detected: snapshot, blocked: blockedIds }),
         }).catch((err) => {
           console.warn('[computer] engine snapshot report failed', err instanceof Error ? err.message : err)
         })
