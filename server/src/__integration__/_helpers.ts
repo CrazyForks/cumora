@@ -14,8 +14,8 @@
  * subsume).
  */
 import { createHmac, randomUUID } from 'node:crypto'
-import { pool } from '../db/pool.js'
 import { ensureSchema } from '../db/migrate.js'
+import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 
 let schemaReady: Promise<void> | null = null
@@ -31,7 +31,12 @@ export function ensureSchemaOnce(): Promise<void> {
  *  constraints; CASCADE on the parents handles it but listing explicitly
  *  keeps the intent visible + lets us spot-check leakage. */
 const TABLES_TO_WIPE: readonly string[] = [
+  'workspace_cleanup_jobs',
   'realtime_outbox',
+  'audit_events',
+  'llm_calls_rollup',
+  'llm_calls',
+  'agent_triages',
   'shipping_events',
   'shipping_regressions',
   'shipping_friction_reports',
@@ -54,18 +59,29 @@ const TABLES_TO_WIPE: readonly string[] = [
   'email_attachments',
   'email_messages',
   'email_contacts',
+  'poll_votes',
   'message_reactions',
+  'tool_calls',
+  'conversation_mutes',
   'conversation_reads',
+  'convene_transcript',
+  'convene_sessions',
+  'convening_info',
   'conversation_counters',
   'messages',
   'conversation_members',
   'conversations',
   'agent_climate',
+  'agent_autonomy',
   'agent_workspace',
+  'agent_memory',
   'agent_runs',
   'agent_events',
   'agent_tasks',
   'agent_log',
+  'user_preferences',
+  'company_invitations',
+  'projects',
   'company_members',
   'participants',
   'computers',

@@ -26,6 +26,8 @@ import { UpdateBanner, UpdaterDialog } from '@/components/UpdaterDialog'
 import { AdminApp } from '@/admin/AdminApp'
 import { WaitlistConfirmedScreen, consumeWaitlistFragment } from '@/admin/WaitlistConfirmedScreen'
 import { SuspendedScreen, consumeSuspendedFragment } from '@/admin/SuspendedScreen'
+import { NoWorkspaceScreen } from '@/components/NoWorkspaceScreen'
+import { WorkspaceSessionBridge } from '@/components/WorkspaceSessionBridge'
 import '@/admin/admin.css'
 
 /** True iff this browser tab is for the admin panel. On prod the
@@ -262,7 +264,10 @@ export function App() {
   return (
     <AuthGate>
       <ErrorBoundary>
-        <AuthedApp key={`${userId ?? 'anon'}::${companyId ?? 'none'}`} />
+        <WorkspaceSessionBridge />
+        {userId && !companyId
+          ? <NoWorkspaceScreen />
+          : <AuthedApp key={`${userId ?? 'anon'}::${companyId ?? 'none'}`} />}
       </ErrorBoundary>
     </AuthGate>
   )
