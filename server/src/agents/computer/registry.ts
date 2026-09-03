@@ -19,6 +19,7 @@ import { pool } from '../../db/pool.js'
 import { CH_STATUS, publish } from '../../redis.js'
 import { normalizeTier, type Tier } from '../../tier.js'
 import { signAgentToken } from '../runtime/jwt.js'
+import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalogSource } from './model-catalog.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
 export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
@@ -137,6 +138,7 @@ export interface DetectedEngine {
    *  an engine could vanish from a computer with no explanation anywhere the
    *  operator was looking. */
   blockedReason?: string | null
+  modelCatalog?: EngineModelCatalog
 }
 
 /** Trim a daemon-reported display string, or drop it. Control characters are
@@ -159,6 +161,45 @@ function sanitizeVersionFields(rec: Record<string, unknown>): Partial<DetectedEn
     // stale `outdated: true` with both versions equal would nag forever.
     outdated: rec.outdated === true && !!version && !!latest && version !== latest,
     updateCommand,
+  }
+}
+
+function sanitizeModelCatalog(raw: unknown): EngineModelCatalog | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const rec = raw as Record<string, unknown>
+  const source: ModelCatalogSource = rec.source === 'protocol' || rec.source === 'cli' || rec.source === 'presets'
+    ? rec.source
+    : 'presets'
+  const fastModelScope: FastModelScope = rec.fastModelScope === 'computer' || rec.fastModelScope === 'unsupported'
+    ? rec.fastModelScope
+    : 'agent'
+  const models: EngineModelOption[] = []
+  const seen = new Set<string>()
+  if (Array.isArray(rec.models)) {
+    for (const rawModel of rec.models.slice(0, 128)) {
+      if (!rawModel || typeof rawModel !== 'object') continue
+      const model = rawModel as Record<string, unknown>
+      const id = displayString(model.id, 160)
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      const recommendedFor = Array.isArray(model.recommendedFor)
+        ? model.recommendedFor.filter((tier): tier is 'big' | 'small' => tier === 'big' || tier === 'small').slice(0, 2)
+        : undefined
+      models.push({
+        id,
+        label: displayString(model.label, 160) ?? id,
+        description: displayString(model.description, 320),
+        ...(recommendedFor?.length ? { recommendedFor } : {}),
+      })
+    }
+  }
+  return {
+    models,
+    defaultModel: displayString(rec.defaultModel, 160),
+    defaultFastModel: displayString(rec.defaultFastModel, 160),
+    supportsCustom: rec.supportsCustom !== false,
+    fastModelScope,
+    source,
   }
 }
 
@@ -201,7 +242,11 @@ export function sanitizeDetectedEngines(
     // A reason is only meaningful on an engine we actually refused. Accepting
     // one on a runnable engine would let a daemon mark a working engine broken.
     const blockedReason = blocked.includes(id) ? displayString(rec.blockedReason, 200) : null
-    byId.set(id, { id, bin, path, ...sanitizeVersionFields(rec), blockedReason })
+    const modelCatalog = sanitizeModelCatalog(rec.modelCatalog)
+    byId.set(id, {
+      id, bin, path, ...sanitizeVersionFields(rec), blockedReason,
+      ...(modelCatalog ? { modelCatalog } : {}),
+    })
   }
   // Every row carries the same keys, reported or not, so the app never has to
   // distinguish "field absent" from "nothing installed to report".
@@ -891,14 +936,29 @@ export async function assignAgentToComputer(args: {
   engine?: string
   /** When true (or when no engine is named), follow the computer default. */
   inherit?: boolean
+  /** Optional model pins to persist in the same participant UPDATE as the
+   *  host/engine assignment. undefined leaves the value untouched; null clears it. */
+  model?: string | null
+  fastModel?: string | null
 }): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
-  const placement = await resolveComputerAssignment(args)
+  const placement = await resolveComputerAssignment({ ...args, strictEngine: true })
   if (!placement) return null
 
+  const sets = ['computer_id = $1', 'engine = $2', 'engine_inherit = $3']
+  const params: unknown[] = [args.computerId, placement.engine, placement.inherit]
+  if (args.model !== undefined) {
+    params.push(args.model)
+    sets.push(`model = $${params.length}`)
+  }
+  if (args.fastModel !== undefined) {
+    params.push(args.fastModel)
+    sets.push(`fast_model = $${params.length}`)
+  }
+  params.push(args.agentId, args.companyId)
   const { rowCount } = await pool.query(
-    `UPDATE participants SET computer_id = $1, engine = $2, engine_inherit = $3
-      WHERE id = $4 AND company_id = $5 AND kind = 'agent'`,
-    [args.computerId, placement.engine, placement.inherit, args.agentId, args.companyId],
+    `UPDATE participants SET ${sets.join(', ')}
+      WHERE id = $${params.length - 1} AND company_id = $${params.length} AND kind = 'agent'`,
+    params,
   )
   if (!rowCount) return null
   return placement
