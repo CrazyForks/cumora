@@ -812,7 +812,9 @@ function countAssistantContent(content: unknown): { toolUses: number; textChars:
   return { toolUses, textChars }
 }
 
-function failurePreview(args: {
+/** Exported for tests: pure, and the only way to pin what an operator actually
+ *  reads after every cap downstream has taken its bite. */
+export function failurePreview(args: {
   exitCode: number
   signalName: NodeJS.Signals | null
   stderr: string[]
@@ -825,7 +827,21 @@ function failurePreview(args: {
   const prefix = args.signalName
     ? `process terminated by ${args.signalName}`
     : `process exited with code ${args.exitCode}`
-  return detail ? `${prefix}\n${detail}`.slice(0, MAX_FAILURE_CHARS) : prefix
+  if (!detail) return prefix
+  // Everything downstream cuts from the END — this cap, then the daemon's own
+  // 900-character one — and two of the engines put the reason on the LAST line.
+  // Measured on the installed binaries, each given one flag it does not know:
+  // gemini 0.1.15 prints 2,819 characters of help with the cause at offset
+  // 2,765; qwen 0.0.14, 3,798 with the cause at 3,744. Both dump their entire
+  // --help to stderr. So the operator's notice was 900 characters of option
+  // documentation, truncated mid-word, with no reason anywhere in it.
+  //
+  // salientError() already leads with this line, for exactly this reason, but
+  // only the probe and handshake paths go through it — an ordinary turn lands
+  // here instead. Lead with the cause and keep the full output behind it.
+  const rejected = argvRejection(detail)
+  const body = rejected ? `${rejected}\n${detail}` : detail
+  return `${prefix}\n${body}`.slice(0, MAX_FAILURE_CHARS)
 }
 
 /** Write to an engine's stdin without letting a dead pipe crash the process.
