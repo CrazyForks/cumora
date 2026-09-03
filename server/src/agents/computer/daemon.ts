@@ -245,6 +245,50 @@ const OPERATOR_FIX_RE = /not logged in|please run \/login|credit balance is too 
 export function needsOperatorFix(err: string | null | undefined): boolean {
   return !!err && OPERATOR_FIX_RE.test(err)
 }
+
+/** What a finished engine turn says about trying again, in one place.
+ *
+ *  A turn ends on one of two paths — the chat wake, and the proactive agenda
+ *  heartbeat that fires every AGENDA_CHECK_MS on its own — and both end at this
+ *  same question. They used to answer it differently: the chat path put a
+ *  signed-out engine to sleep for fifteen minutes, and the agenda path did not.
+ *  So an agent nobody happened to be chatting with kept exactly the spin the
+ *  pause exists to stop, one dead spawn a minute, indefinitely.
+ *
+ *  Classifying once is what keeps the two paths honest. A path can still fail to
+ *  ASK — which is one grep away — but it can no longer hold a different opinion
+ *  than the other about what a given failure means.
+ *
+ *  Order matters: a throttle that also mentions quota is a throttle. It clears
+ *  itself, so it takes the short cooldown and stays out of the user's chat. */
+export type TurnOutcome =
+  /** Clean turn — cancel any pause this agent was under. */
+  | 'ok'
+  /** Provider throttle. Clears itself: short cooldown, no user-facing notice. */
+  | 'rate-limited'
+  /** Only a human can clear it. Long pause, and tell someone. */
+  | 'operator-fix'
+  /** Cause unknown. Keep retrying, and leave any existing pause alone. */
+  | 'transient'
+
+export function classifyTurnOutcome(engineError: string | null | undefined): TurnOutcome {
+  if (!engineError) return 'ok'
+  if (isRateLimited(engineError)) return 'rate-limited'
+  if (needsOperatorFix(engineError)) return 'operator-fix'
+  return 'transient'
+}
+
+/** The engine backoff deadline a finished turn implies, or null to leave the
+ *  current one untouched. Null is not zero: an unexplained failure must not
+ *  cancel a pause an earlier, well-understood one established. */
+export function backoffUntilFor(outcome: TurnOutcome, now: number): number | null {
+  switch (outcome) {
+    case 'ok': return 0
+    case 'rate-limited': return now + ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS
+    case 'operator-fix': return now + ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS
+    case 'transient': return null
+  }
+}
 // Neutral cwd for LOCAL small-brain triage: no persona CLAUDE.md / skills / MCP,
 // so the cerebellum completion is fast and tool-free.
 const TRIAGE_DIR = join(CONFIG_DIR, 'triage')
@@ -1532,9 +1576,14 @@ class AgentRunner {
   // expires. Without this, we'd re-attempt on every poll + SSE wake (each
   // burning a real call against the same throttle that just rejected us)
   // and the loop is visible to the user as 100+ rate-limit log lines and
-  // 30-65s end-to-end latency per turn. Set to now + ENGINE_BACKOFF_*
-  // when isRateLimited(engineError); cleared by the next successful spawn.
+  // 30-65s end-to-end latency per turn. A signed-out engine earns the same
+  // treatment for longer, since retrying it cannot succeed at all. Assigned
+  // only by applyTurnBackoff(), from the outcome BOTH turn paths classify.
   private engineBackoffUntil = 0
+  /** Why this agent is paused, for the skip log. A fifteen-minute operator
+   *  pause used to print as a rate-limit cooldown, which sends whoever is
+   *  reading the daemon log looking for a throttle that was never there. */
+  private engineBackoffWhy = 'rate limit'
   private stopped = false
   private lastWakeConvo: string | null = null
   /** Synthetic work delivered with a wake has no durable chat row. Preserve it
@@ -1902,6 +1951,16 @@ class AgentRunner {
       console.log(`[computer] ${this.agent.id} engine session ${this.sessionId ? `respawned (resume ${this.sessionId.slice(0, 8)})` : 'spawned fresh'} — persistent, no per-wake cold start`)
     }
     return this.engineSession
+  }
+
+  /** Enter, or clear, this agent's engine pause for a finished turn. Both turn
+   *  paths call this and nothing else assigns engineBackoffUntil, so the chat
+   *  wake and the agenda heartbeat cannot drift apart again. */
+  private applyTurnBackoff(outcome: TurnOutcome): void {
+    const until = backoffUntilFor(outcome, Date.now())
+    if (until === null) return
+    this.engineBackoffUntil = until
+    this.engineBackoffWhy = outcome === 'operator-fix' ? 'operator action needed' : 'rate limit'
   }
 
   private visibleEngineError(exitCode: number, detail?: string): string {
@@ -2383,14 +2442,14 @@ class AgentRunner {
     if (now - this.lastTurnEndedAt < AGENDA_QUIET_MS) return
     if (now - this.lastAgendaCheckAt < AGENDA_CHECK_MS) return
     this.lastAgendaCheckAt = now
-    // Same cooldown guard as runTurn — if this agent was just rate-limited
-    // on a chat turn, skip the agenda heartbeat too (it'd hit the same
-    // throttle). Re-fires on the next AGENDA_CHECK_MS tick after cooldown.
+    // Same pause guard as runTurn — a throttle or a signed-out engine hit on a
+    // chat turn stops the heartbeat too, because it would hit exactly the same
+    // wall. Re-fires on the next AGENDA_CHECK_MS tick once the pause expires.
     // Place this BEFORE the /agenda fetch + /runs row creation so we don't
     // leak a 'running' run row that the stale-run sweeper later reaps.
     if (Date.now() < this.engineBackoffUntil) {
       const leftS = Math.round((this.engineBackoffUntil - Date.now()) / 1000)
-      console.log(`[computer] ${this.agent.id} agenda skip: engine rate-limit cooldown, ${leftS}s left`)
+      console.log(`[computer] ${this.agent.id} agenda skip: engine paused (${this.engineBackoffWhy}), ${leftS}s left`)
       return
     }
     const ag = await runtimeGet<{ actionable?: boolean; brief?: string; focus?: string }>(
@@ -2467,18 +2526,24 @@ class AgentRunner {
     // Rate-limit: same as chat-turn path — suppress the user-facing notice
     // and just defer (no inbox state to keep here since agenda turns are
     // proactive; next heartbeat re-evaluates after cooldown).
-    const agendaRateLimited = engineError ? isRateLimited(engineError) : false
-    if (engineError && !agendaRateLimited) {
+    const outcome = classifyTurnOutcome(engineError)
+    if (engineError && outcome !== 'rate-limited') {
       await this.publishEngineFailure({ token, runId: run?.runId, conversationId: null, error: engineError, exitCode })
     }
-    if (engineError && agendaRateLimited) {
-      this.engineBackoffUntil = Date.now() + ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS
+    if (outcome === 'rate-limited') {
       spawnPacer.onRateLimited()
       console.warn(`[computer] ${this.agent.id} agenda engine RATE-LIMITED — cooling down ${Math.round(ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS / 1000)}s, pacer now ${spawnPacer.intervalMs}ms`)
-    } else if (!engineError) {
-      this.engineBackoffUntil = 0
+    } else if (outcome === 'operator-fix') {
+      // This heartbeat used to be the one path that published the notice and
+      // then came straight back a minute later, and again, for as long as the
+      // engine stayed signed out — fifteen dead spawns per agent inside the
+      // single window the notice is deduplicated over, so the fleet burned its
+      // error budget while the operator saw one message about it.
+      console.warn(`[computer] ${this.agent.id} agenda engine needs operator action — pausing ${Math.round(ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS / 60000)}min: ${engineError?.slice(0, 160)}`)
+    } else if (outcome === 'ok') {
       spawnPacer.onOk()
     }
+    this.applyTurnBackoff(outcome)
     // Finalize the run — WITHOUT this the row stays 'running' and the 10-min
     // stale-run sweeper reaps EVERY agenda turn as "orphaned" (the bug behind the
     // recurring Failed/orphaned runs), no matter how fast the turn actually was.
@@ -2629,7 +2694,7 @@ class AgentRunner {
         // kept (no ack), so the next wake AFTER the cooldown will pick it up.
         if (Date.now() < this.engineBackoffUntil) {
           const leftS = Math.round((this.engineBackoffUntil - Date.now()) / 1000)
-          console.log(`[computer] ${this.agent.id} skip (${reason}): engine rate-limit cooldown, ${leftS}s left`)
+          console.log(`[computer] ${this.agent.id} skip (${reason}): engine paused (${this.engineBackoffWhy}), ${leftS}s left`)
           break
         }
         const turnStart = Date.now()
@@ -2918,14 +2983,14 @@ class AgentRunner {
         // user from seeing a row of "byoa_engine_failed" markers in chat for
         // what is really a transient provider throttle. Persist a quieter
         // signal to the run row instead so it shows up in observability.
-        const rateLimited = engineError ? isRateLimited(engineError) : false
+        const outcome = classifyTurnOutcome(engineError)
+        const rateLimited = outcome === 'rate-limited'
         // An engine nobody has logged into will fail the same way on the next
         // poll, and the one after that. Cool down like a rate limit so the
         // machine stops spinning, but tell the user — a silent backoff on a
         // fixable problem is just a slower way of never working.
-        if (engineError && !rateLimited && needsOperatorFix(engineError)) {
-          this.engineBackoffUntil = Date.now() + ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS
-          console.warn(`[computer] ${this.agent.id} engine needs operator action — pausing ${Math.round(ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS / 60000)}min: ${engineError.slice(0, 160)}`)
+        if (outcome === 'operator-fix') {
+          console.warn(`[computer] ${this.agent.id} engine needs operator action — pausing ${Math.round(ENGINE_BACKOFF_AFTER_OPERATOR_FIX_MS / 60000)}min: ${engineError?.slice(0, 160)}`)
         }
         if (engineError && !rateLimited) {
           await this.publishEngineFailure({
@@ -2945,15 +3010,14 @@ class AgentRunner {
           // ALSO tell the global adaptive pacer to slow down — multiple
           // agents hitting rate-limit means the current interval is too
           // aggressive for the account's actual burst quota.
-          this.engineBackoffUntil = Date.now() + ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS
           this.pendingRerun = false
           spawnPacer.onRateLimited()
           console.warn(`[computer] ${this.agent.id} engine RATE-LIMITED (sem queue depth was ${semQueueDepth}) — cooling down ${Math.round(ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS / 1000)}s, pacer now ${spawnPacer.intervalMs}ms`)
-        } else if (!engineError) {
-          // Clean turn → clear any prior engine backoff + signal pacer.
-          this.engineBackoffUntil = 0
+        } else if (outcome === 'ok') {
+          // Clean turn → signal the pacer; the backoff itself is cleared below.
           spawnPacer.onOk()
         }
+        this.applyTurnBackoff(outcome)
         if (run?.runId) {
           await runtimeBest(this.cfg.serverUrl, `/runs/${run.runId}/finish`, token, {
             status: exitCode === 0 ? 'completed' : 'failed',
