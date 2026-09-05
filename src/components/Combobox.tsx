@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { initialActiveIndex } from '@/lib/combobox-highlight'
 import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
@@ -77,12 +78,13 @@ export function Combobox<T extends string = string>({
     : ''
   const resultCount = filtered.length + (customValue ? 1 : 0)
 
-  // Keep the highlight on the current value when the menu (re)opens, else top.
+  // Keep the highlight on the current value when the menu (re)opens, else top —
+  // except when the query names one option exactly, which wins. See
+  // combobox-highlight.ts for the case that made the exception necessary.
   useEffect(() => {
     if (!open) return
-    const idx = filtered.findIndex((o) => o.value === value)
-    setActiveIndex(idx >= 0 ? idx : 0)
-  }, [open, filtered, value, customValue])
+    setActiveIndex(initialActiveIndex(filtered, value, query))
+  }, [open, filtered, value, query, customValue])
 
   // Close on outside click.
   useEffect(() => {
