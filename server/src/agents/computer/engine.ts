@@ -5446,6 +5446,7 @@ function salientError(raw: string): string {
  *  real wakes will work. Engines are probed in parallel; the two tiers of one
  *  engine run sequentially to avoid self-induced rate limits. Never throws. */
 export async function runEngineDoctor(opts?: {
+  engines?: EngineId[]
   env?: NodeJS.ProcessEnv
   /** Per-tier timeout. Default 60s — a cold engine + auth handshake can be slow. */
   timeoutMs?: number
@@ -5454,7 +5455,7 @@ export async function runEngineDoctor(opts?: {
   const env = opts?.env ?? process.env
   const timeoutMs = opts?.timeoutMs ?? 60_000
   const cwd = await mkdtemp(join(tmpdir(), 'cumora-doctor-'))
-  const ids = Object.keys(ADAPTERS) as EngineId[]
+  const ids = opts?.engines ?? Object.keys(ADAPTERS) as EngineId[]
   return Promise.all(ids.map(async (id): Promise<EngineHealth> => {
     const adapter = ADAPTERS[id]
     const path = (await resolveBinPath(adapter.bin)) ?? (id === 'grok' ? resolveGrokBin(env) : null)
