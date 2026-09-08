@@ -2778,14 +2778,53 @@ export async function ensureConcurrentIndex(
       WHERE n.nspname = current_schema() AND c.relname = $1`,
     [name],
   )
-  if (rows[0] && (!rows[0].indisvalid || !rows[0].indisready || !rows[0].indislive)) {
-    console.warn(`[db] dropping invalid leftover index ${name} before rebuild`)
-    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${name}`)
-  } else if (rows[0]) {
-    return
+  if (rows[0] && rows[0].indisvalid && rows[0].indisready && rows[0].indislive) return
+
+  // `ensureSchema` pins the migration session at `lock_timeout = '5s'` so an
+  // ordinary ALTER cannot sit behind a long lock and stall the deploy. A
+  // CONCURRENTLY build is the one operation that guard must not cover.
+  //
+  // It takes no blocking lock — that is the entire point of it — but it does
+  // WaitForOlderSnapshots: it waits out every transaction that started before
+  // it, anywhere in the database, on any table. `lock_timeout` counts that wait,
+  // so ANY transaction open longer than five seconds kills the build with 55P03
+  // and leaves an index with indisvalid=f behind: every INSERT maintains it, no
+  // planner will use it. This repo documents such transactions itself — the
+  // per-agent scan below is noted at "~8s".
+  //
+  // Measured on Postgres 16: one 30s read on an UNRELATED table is enough. Under
+  // `lock_timeout='5s'` the build dies at 5.0s leaving indisvalid=f; with the
+  // timeout lifted the same build completes.
+  //
+  // ensureMessageClientIdIndex has bracketed itself this way since it was
+  // written; putting it here instead means every concurrent build inherits it,
+  // including the two migrations added in 0.16 that reach this from the
+  // versioned ledger rather than from the baseline.
+  const previous = await currentLockTimeout(client)
+  await client.query("SET lock_timeout = '0'")
+  try {
+    if (rows[0]) {
+      console.warn(`[db] dropping invalid leftover index ${name} before rebuild`)
+      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${name}`)
+    }
+    await client.query(create)
+  } finally {
+    // Restore what the caller had rather than assuming '5s': the helper must not
+    // silently widen the guard for the statements that follow it.
+    await client.query(`SET lock_timeout = ${quoteLiteral(previous)}`)
   }
-  await client.query(create)
   console.log(`[db] concurrent index ready: ${name}`)
+}
+
+/** The session's current lock_timeout, as a string SET will accept back. */
+async function currentLockTimeout(client: import('pg').PoolClient): Promise<string> {
+  const { rows } = await client.query<{ lock_timeout: string }>('SHOW lock_timeout')
+  return rows[0]?.lock_timeout ?? '5s'
+}
+
+/** Single-quote a value for a SET that cannot take a bind parameter. */
+function quoteLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
 }
 
 async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<void> {
