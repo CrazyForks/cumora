@@ -269,3 +269,4 @@ test('email handler accepts email on 200 response without setReject', async () =
     globalThis.fetch = originalFetch
   }
 })
+
