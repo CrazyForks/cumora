@@ -469,15 +469,31 @@ async function wakeOne(
     if (!host) return false
   }
 
+  // Is there anything left to catch up ON? `message.new` is backed by the
+  // message row, so a runtime that was offline finds it on its next drain and
+  // an undelivered wake still comes true. Every other reason carries its whole
+  // content in the payload — an idle nudge, the scanner's brief, a manual poke
+  // — and that payload is gone the moment nobody is subscribed. The managed-pod
+  // path below already draws this line (it replays a synthetic wake until the
+  // pod attaches, and returns false if it never does); these two early returns
+  // are the same wake taking a different exit, and they were reporting success
+  // for a brief that reached no one.
+  //
+  // The scanner is the caller that notices: on `false` it declines to spend the
+  // activity fingerprint, so the next pass re-evaluates once the daemon is back.
+  // On `true` it records "background scan wake queued", claims the fingerprint,
+  // and that scan is never offered again.
+  const durableWithoutDelivery = reason === 'message.new'
+
   // BYOA agents run on a user-paired Computer (the `cumora agent computer`
   // daemon), never a server-managed pod. If delivered === 0 the daemon
   // simply isn't subscribed right now (host offline / asleep) — there's
-  // nothing to spin up. The wake is durable via the inbox, so the daemon
-  // catches up on its next reconnect drain, same as a cold pod would.
-  // Skip the pod path entirely; do NOT ensurePod / wake-retry kubectl.
+  // nothing to spin up. Skip the pod path entirely; do NOT ensurePod /
+  // wake-retry kubectl.
   if (isByoaKind(host.kind)) {
-    console.log(`[scheduler] ${agentId} is BYOA (${host.kind}); daemon offline — wake deferred to reconnect`)
-    return true
+    console.log(`[scheduler] ${agentId} is BYOA (${host.kind}); daemon offline — ${
+      durableWithoutDelivery ? 'wake deferred to reconnect' : `${reason} wake not delivered`}`)
+    return durableWithoutDelivery
   }
 
   // Free tier is BYOA-only: it must NEVER spin a managed Cumora Cloud pod. A free
@@ -489,8 +505,9 @@ async function wakeOne(
   // leak; the polluted legacy data (cloud computers + managed engines) was cleaned
   // up separately. The wake stays durable in the inbox for whenever they pair.
   if (host.tier === 'free') {
-    console.log(`[scheduler] ${agentId} is free-tier (BYOA-only); no managed pod — wake deferred until paired`)
-    return true
+    console.log(`[scheduler] ${agentId} is free-tier (BYOA-only); no managed pod — ${
+      durableWithoutDelivery ? 'wake deferred until paired' : `${reason} wake not delivered`}`)
+    return durableWithoutDelivery
   }
 
   // Paid (pro/max) managed agent — spin up a Pod. The Pod will catch up on first
