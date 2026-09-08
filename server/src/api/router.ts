@@ -5029,7 +5029,24 @@ class QueryAbandonedError extends Error {}
  * a command). A cancelled or timed-out search resolves to no rows rather than
  * throwing: there is no longer anyone to show an error to, and a partial
  * dropdown is a better failure than a 500.
+ *
+ * A pid alone is not a safe thing to cancel. Nothing waits for that cancel — it
+ * is fired with `void` — so it can still be in flight when the abandoned search
+ * finishes on its own and `finally` hands the connection back. The idle pool is
+ * a LIFO stack, so the very next borrower gets that same backend, and the
+ * cancel lands on THEIR query. Measured against Postgres 16: it kills them with
+ * 57014, which for another search means silently empty results and for anything
+ * else a 500 — on a request that did nothing wrong.
+ *
+ * So the cancel names the search, not just the backend. Each search publishes a
+ * unique token as its `application_name` for the life of its transaction
+ * (`set_config(…, is_local => true)`, so it reverts at COMMIT/ROLLBACK exactly
+ * like the timeout above), and the cancel only fires on a backend still
+ * carrying that token. A cancel that arrives late now matches nothing.
  */
+export const CANCEL_ABANDONED_SEARCH_SQL = `SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+   WHERE pid = $1 AND application_name = $2 AND state = 'active'`
+
 async function searchMessagesBounded(
   res: Response,
   params: unknown[],
@@ -5038,13 +5055,16 @@ async function searchMessagesBounded(
   const client = await pool.connect()
   let backendPid: number | null = null
   let abandoned = false
+  // Identifies THIS search on THIS backend, for exactly as long as it runs.
+  const searchToken = `cumora-search:${randomUUID()}`
   const cancelIfRunning = (): void => {
     // `close` also fires on a normal, fully-written response — only an early
     // close means the caller is gone.
     if (res.writableEnded) return
     abandoned = true
     if (backendPid == null) return
-    void pool.query('SELECT pg_cancel_backend($1)', [backendPid]).catch(() => { /* best effort */ })
+    void pool.query(CANCEL_ABANDONED_SEARCH_SQL, [backendPid, searchToken])
+      .catch(() => { /* best effort */ })
   }
   res.on('close', cancelIfRunning)
   try {
@@ -5052,7 +5072,12 @@ async function searchMessagesBounded(
     // SET LOCAL, not SET: the deadline dies with this transaction, so releasing
     // the connection cannot leak a 3s timeout onto the next borrower.
     await client.query(`SET LOCAL statement_timeout = ${SEARCH_MESSAGE_TIMEOUT_MS}`)
-    const pid = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+    // Both in one round trip — the token has to be published before we hand the
+    // pid to a canceller, and SET takes no bind parameter, so set_config it is.
+    const pid = await client.query<{ pid: number }>(
+      'SELECT pg_backend_pid() AS pid, set_config($1, $2, true)',
+      ['application_name', searchToken],
+    )
     backendPid = pid.rows[0]?.pid ?? null
     if (abandoned) throw new QueryAbandonedError()
     const result = await client.query<{ body: string } & Record<string, unknown>>(sql, params)
