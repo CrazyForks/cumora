@@ -3929,8 +3929,16 @@ const ONE_SHOT_SUBCOMMAND_RE = /\bagent computer (?:doctor|help)\b/
  *  candidate set. Killing the wrapper's child is what actually stops the daemon,
  *  and the wrapper exits with it. */
 export function isStoppableDaemonCommand(cmd: string): boolean {
-  if (!/agent computer/.test(cmd)) return false
+  if (!isCumoraAgentCommand(cmd)) return false
   return !ONE_SHOT_FLAG_RE.test(cmd) && !ONE_SHOT_SUBCOMMAND_RE.test(cmd)
+}
+
+/** Is this `ps`-reported command line one of ours at all? Weaker than
+ *  `isStoppableDaemonCommand` on purpose: it says nothing about whether the
+ *  process is the long-running daemon, only that a pid we already have other
+ *  evidence for has not been recycled by some unrelated program. */
+export function isCumoraAgentCommand(cmd: string): boolean {
+  return /agent computer/.test(cmd)
 }
 
 async function commandLineForPid(pid: number): Promise<string> {
@@ -4013,9 +4021,10 @@ async function stopWindowsWatchdog(taskName: string): Promise<void> {
  *  bounded fallback so engine descendants cannot be orphaned. */
 async function killRunningDaemons(): Promise<void> {
   const candidates = new Set<number>()
+  let recordedPid: number | null = null
   try {
     const pid = (JSON.parse(await readFile(RUNNING_STATE_PATH, 'utf8')) as { pid?: number }).pid
-    if (typeof pid === 'number' && pid > 0) candidates.add(pid)
+    if (typeof pid === 'number' && pid > 0) { candidates.add(pid); recordedPid = pid }
   } catch { /* no pid file */ }
   if (process.platform === 'win32') {
     for (const item of await windowsDaemonProcesses()) candidates.add(item.ProcessId)
@@ -4027,16 +4036,26 @@ async function killRunningDaemons(): Promise<void> {
   }
   candidates.delete(process.pid)
   if (typeof process.ppid === 'number') candidates.delete(process.ppid)
+
+  // running.json is written by `doRun` itself, so a pid recorded there HAS
+  // become the long-running daemon whatever its flags say. That matters because
+  // one real daemon's command line does carry a one-shot flag: `--pair` on a
+  // machine with no service installed pairs and then falls through to `doRun`,
+  // which is the whole first-run onboarding path. Judging it by its flags left
+  // `--stop` reporting "daemon process(es) killed" while that daemon kept
+  // running, kept claiming agent turns, and could only be stopped by closing the
+  // terminal. For that pid we only re-confirm it is still one of ours, so a
+  // stale file whose pid the OS has recycled cannot make us kill a stranger.
+  //
+  // Every other candidate comes from a bare pgrep and carries no such evidence,
+  // so it keeps the strict rule — a sibling one-shot CLI must never be killed.
+  const isVictimCommand = (pid: number, cmd: string): boolean =>
+    pid === recordedPid ? isCumoraAgentCommand(cmd) : isStoppableDaemonCommand(cmd)
+
   const victims: number[] = []
   for (const pid of candidates) {
     try {
-      const cmd = await commandLineForPid(pid)
-      // A genuine long-running daemon: "agent computer" with NO one-shot flag —
-      // so we never kill a sibling one-shot CLI. (Ourselves and our parent are
-      // already out of `candidates`.)
-      if (isStoppableDaemonCommand(cmd)) {
-        victims.push(pid)
-      }
+      if (isVictimCommand(pid, await commandLineForPid(pid))) victims.push(pid)
     } catch { /* gone */ }
   }
   if (process.platform === 'win32') {
@@ -4051,7 +4070,7 @@ async function killRunningDaemons(): Promise<void> {
       const next: number[] = []
       for (const pid of survivors) {
         try {
-          if (isStoppableDaemonCommand(await commandLineForPid(pid))) next.push(pid)
+          if (isVictimCommand(pid, await commandLineForPid(pid))) next.push(pid)
         } catch { /* exited */ }
       }
       survivors = next
@@ -4061,14 +4080,14 @@ async function killRunningDaemons(): Promise<void> {
     }
     for (const pid of victims) await rm(windowsShutdownRequestPath(pid), { force: true }).catch(() => {})
     const forceDeadline = Date.now() + 2_000
-    let remaining = (await windowsDaemonProcesses()).filter((item) =>
-      item.ProcessId !== process.pid && item.ProcessId !== process.ppid &&
-      isStoppableDaemonCommand(item.CommandLine))
+    const stillRunning = async (): Promise<WindowsProcessInfo[]> =>
+      (await windowsDaemonProcesses()).filter((item) =>
+        item.ProcessId !== process.pid && item.ProcessId !== process.ppid &&
+        isVictimCommand(item.ProcessId, item.CommandLine))
+    let remaining = await stillRunning()
     while (remaining.length > 0 && Date.now() < forceDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 100))
-      remaining = (await windowsDaemonProcesses()).filter((item) =>
-        item.ProcessId !== process.pid && item.ProcessId !== process.ppid &&
-        isStoppableDaemonCommand(item.CommandLine))
+      remaining = await stillRunning()
     }
     if (remaining.length > 0) {
       throw new Error(`Windows daemon process(es) still running: ${remaining.map((item) => item.ProcessId).join(', ')}`)
