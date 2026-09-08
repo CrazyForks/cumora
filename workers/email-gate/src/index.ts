@@ -42,6 +42,7 @@ interface InboundAttachment {
 
 interface InboundPayload {
   messageId: string
+  envelopeTo: string
   inReplyTo: string | null
   references: string[]
   from: string
@@ -196,6 +197,12 @@ export default {
       // To / Cc — postal-mime returns Address[]. Fall back to the envelope
       // recipient if the header is missing (rare but happens).
       to: (parsed.to ?? []).map(fmtAddress).filter(Boolean),
+      // The address SMTP actually delivered to, and the one this worker
+      // admitted the message on two dozen lines up. It is absent from the
+      // headers whenever the agent was Bcc'd or reached through an alias or a
+      // forwarding rule, and then it is the ONLY thing identifying the
+      // recipient — so send it always, not just when To: happens to be empty.
+      envelopeTo: message.to,
       cc: (parsed.cc ?? []).map(fmtAddress).filter(Boolean),
       subject: parsed.subject ?? '',
       text: (parsed.text ?? '').trim(),

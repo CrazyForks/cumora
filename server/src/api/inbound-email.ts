@@ -103,6 +103,10 @@ interface InboundPayload {
   references?: string[] | null
   /** Each address is a "Name <addr@host>" or just "addr@host" string. */
   from: string
+  /** The envelope recipient — the address SMTP actually delivered to, which
+   *  the gate already checked is one of ours before admitting the message.
+   *  Optional so a gate deployed before this field still works. */
+  envelopeTo?: string | null
   to?: string[]
   cc?: string[]
   subject?: string
@@ -265,7 +269,14 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
     res.status(400).json({ error: `unparseable from: ${payload.from}` })
     return
   }
-  const rawRecipients = [...(payload.to ?? []), ...(payload.cc ?? [])]
+  // The envelope recipient belongs in this set, not just the headers. A Bcc'd
+  // agent appears in no header at all; so does one reached through an alias, a
+  // list expansion or a forwarding rule. Matching on To/Cc alone resolved
+  // nobody for those, which is a 404 here and `setReject` in the gate — a
+  // permanent 550 telling the sender the address does not exist, for mail the
+  // gate had already confirmed was addressed to us. Dedup below folds it away
+  // in the ordinary case where it is also in To.
+  const rawRecipients = [...(payload.to ?? []), ...(payload.cc ?? []), ...(payload.envelopeTo ? [payload.envelopeTo] : [])]
     .map((s) => parseAddress(s))
     .filter((x): x is { addr: string; name: string | null } => Boolean(x))
   if (rawRecipients.length === 0) {

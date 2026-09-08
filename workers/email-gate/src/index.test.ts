@@ -193,6 +193,47 @@ test('email handler throws on upstream 5xx error (triggering SMTP tempfail)', as
   }
 })
 
+/* ===================== the envelope recipient is forwarded ================= */
+
+test('email handler forwards the envelope recipient it admitted the message on', async () => {
+  // The handler gates on recipientAccepted(message.to) — the ENVELOPE
+  // recipient — and then forwarded every field except that one. Whenever the
+  // agent is Bcc'd or reached via an alias, a list expansion or a forwarding
+  // rule, its address is in no header, so the server resolved nobody and
+  // answered 404, which this handler turns into a permanent SMTP 550.
+  const rejected: string[] = []
+  const message = {
+    // Delivered to the agent; the visible header names someone else.
+    to: 'agent@cumora.ai',
+    from: 'alice@example.com',
+    raw: new Response(
+      'From: alice@example.com\r\nTo: bob@example.com\r\nSubject: Test\r\nMessage-ID: <msg-2@example.com>\r\n\r\nHello',
+    ).body!,
+    setReject: (reason: string) => { rejected.push(reason) },
+  } as unknown as Parameters<typeof worker.email>[0]
+
+  let posted: Record<string, unknown> | null = null
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_url, init) => {
+    posted = JSON.parse(String((init as RequestInit).body))
+    return new Response('ok', { status: 200 })
+  }
+  try {
+    await worker.email(message, fakeEnv, fakeCtx)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.deepEqual(rejected, [])
+  assert.ok(posted, 'nothing was posted upstream')
+  assert.equal(
+    (posted as { envelopeTo?: string }).envelopeTo, 'agent@cumora.ai',
+    'the address the handler admitted this message on was not forwarded — a Bcc\'d agent resolves to nobody and gets a 550',
+  )
+  // The visible header is still reported as-is; envelopeTo is additive.
+  assert.deepEqual((posted as { to?: string[] }).to, ['bob@example.com'])
+})
+
 test('email handler rejects with 550 bounce on 404 no recipient', async () => {
   const { message, rejected } = createFakeMessage()
   const originalFetch = globalThis.fetch
