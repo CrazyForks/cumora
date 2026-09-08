@@ -193,43 +193,6 @@ test('email handler throws on upstream 5xx error (triggering SMTP tempfail)', as
   }
 })
 
-test('email handler rejects with 550 bounce on 404 no recipient', async () => {
-  const { message, rejected } = createFakeMessage()
-  const originalFetch = globalThis.fetch
-  globalThis.fetch = async () => new Response('Not Found', { status: 404 })
-  try {
-    await worker.email(message, fakeEnv, fakeCtx)
-    assert.deepEqual(rejected, ['No such recipient'])
-  } finally {
-    globalThis.fetch = originalFetch
-  }
-})
-
-test('email handler rejects with 550 bounce on 4xx client errors', async () => {
-  const { message, rejected } = createFakeMessage()
-  const originalFetch = globalThis.fetch
-  globalThis.fetch = async () => new Response('Bad Request', { status: 400 })
-  try {
-    await worker.email(message, fakeEnv, fakeCtx)
-    assert.deepEqual(rejected, ['Upstream 400'])
-  } finally {
-    globalThis.fetch = originalFetch
-  }
-})
-
-test('email handler accepts email on 200 response without setReject', async () => {
-  const { message, rejected } = createFakeMessage()
-  const originalFetch = globalThis.fetch
-  globalThis.fetch = async () => new Response('OK', { status: 200 })
-  try {
-    await worker.email(message, fakeEnv, fakeCtx)
-    assert.deepEqual(rejected, [])
-  } finally {
-    globalThis.fetch = originalFetch
-  }
-})
-
-
 /* ===================== the envelope recipient is forwarded ================= */
 
 test('email handler forwards the envelope recipient it admitted the message on', async () => {
@@ -269,4 +232,40 @@ test('email handler forwards the envelope recipient it admitted the message on',
   )
   // The visible header is still reported as-is; envelopeTo is additive.
   assert.deepEqual((posted as { to?: string[] }).to, ['bob@example.com'])
+})
+
+test('email handler rejects with 550 bounce on 404 no recipient', async () => {
+  const { message, rejected } = createFakeMessage()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response('Not Found', { status: 404 })
+  try {
+    await worker.email(message, fakeEnv, fakeCtx)
+    assert.deepEqual(rejected, ['No such recipient'])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('email handler rejects with 550 bounce on 4xx client errors', async () => {
+  const { message, rejected } = createFakeMessage()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response('Bad Request', { status: 400 })
+  try {
+    await worker.email(message, fakeEnv, fakeCtx)
+    assert.deepEqual(rejected, ['Upstream 400'])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('email handler accepts email on 200 response without setReject', async () => {
+  const { message, rejected } = createFakeMessage()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response('OK', { status: 200 })
+  try {
+    await worker.email(message, fakeEnv, fakeCtx)
+    assert.deepEqual(rejected, [])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
