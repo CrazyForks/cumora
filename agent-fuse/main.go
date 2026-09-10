@@ -318,6 +318,20 @@ type fileNode struct {
 	generation uint64
 }
 
+// The server stores a whole-file body in a single JSON PUT bounded at 34 MB
+// (`json({ limit: '34mb' })`, server/src/agents/runtime/fs-endpoints.ts), so a
+// body above that can never be written durably. Refusing it here turns a
+// guaranteed EIO at flush -- long after the agent believed the write landed --
+// into an immediate EFBIG at the syscall that asked for it.
+//
+// It also, and more urgently, bounds the allocation. The previous guards only
+// rejected sizes above maxInt, so `truncate -s 1000000000000000000` reached
+// `make([]byte, 1e18)` and panicked with "makeslice: len out of range". go-fuse
+// v2.5.1 has no recover() in its request path, so that panic killed the daemon:
+// /workspace then returned ENOTCONN for the life of the pod and every unflushed
+// dirty file in the process died with it.
+const maxFileBytes = 32 * 1024 * 1024
+
 func (f *fileNode) fillAttr(a *fuse.Attr, size int64) {
 	a.Mode = fuse.S_IFREG | 0o644
 	a.Mtime = uint64(time.Now().Unix())
@@ -394,10 +408,14 @@ func (f *fileNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off
 	if off < 0 {
 		return 0, syscall.EINVAL
 	}
-	maxInt := int(^uint(0) >> 1)
-	if uint64(off) > uint64(maxInt-len(data)) {
+	// Both halves are needed: testing only the offset would compute
+	// `maxFileBytes-len(data)` negative for an oversized payload and wrap it to
+	// a huge uint64, letting the very allocation this guards slip through.
+	if len(data) > maxFileBytes || uint64(off) > uint64(maxFileBytes-len(data)) {
 		return 0, syscall.EFBIG
 	}
+	// Bound the request before hydrating: a doomed write should not also cost
+	// a remote read.
 	if errno := f.ensureCurrentLocked(); errno != 0 {
 		return 0, errno
 	}
@@ -422,17 +440,19 @@ func (f *fileNode) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sy
 }
 
 func (f *fileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	size, resizing := in.GetSize()
+	// Bound before hydrating, so an impossible size costs neither a remote read
+	// nor an allocation.
+	if resizing && size > maxFileBytes {
+		return syscall.EFBIG
+	}
+
 	f.mu.Lock()
 	if errno := f.ensureCurrentLocked(); errno != 0 {
 		f.mu.Unlock()
 		return errno
 	}
-	if size, ok := in.GetSize(); ok {
-		maxInt := uint64(^uint(0) >> 1)
-		if size > maxInt {
-			f.mu.Unlock()
-			return syscall.EFBIG
-		}
+	if resizing {
 		if int(size) < len(f.cachedBody) {
 			f.cachedBody = f.cachedBody[:int(size)]
 		} else if int(size) > len(f.cachedBody) {
@@ -445,6 +465,25 @@ func (f *fileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAt
 	}
 	body := bytes.Clone(f.cachedBody)
 	f.mu.Unlock()
+
+	// A resize that arrives with NO file handle is a path-based truncate(2):
+	// the kernel opened nothing, so it will send neither FLUSH nor RELEASE for
+	// it and persist() would never run -- `truncate -s 5 f` reported success,
+	// reported the new size, and left the stored file untouched forever.
+	//
+	// An ftruncate(2) through an fd does carry a handle, and the kernel emits
+	// FLUSH on every close(2) of that fd -- including the closes it performs
+	// when a process is killed -- so that path keeps batching into the existing
+	// flush rather than paying a second upload. This is the only resize the
+	// kernel will never come back for, so it is the only one we push eagerly.
+	if resizing && fh == nil {
+		if errno := f.persist(); errno != 0 {
+			// persist() leaves the node dirty, so a later open+flush can still
+			// retry; the caller learns now rather than believing a lost write.
+			return errno
+		}
+	}
+
 	f.fillAttr(&out.Attr, int64(len(body)))
 	return 0
 }

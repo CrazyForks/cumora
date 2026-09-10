@@ -360,3 +360,156 @@ func TestFlushFailureKeepsDirtyCacheForRetry(t *testing.T) {
 		t.Fatalf("backend body after retry = %q, want %q", got, "local")
 	}
 }
+
+// ─── Setattr durability and bounds ─────────────────────────────────
+//
+// A path-based truncate(2) never opens the file: the kernel sends SETATTR with
+// no file handle and issues no OPEN/FLUSH/RELEASE, so persist() -- reachable
+// only from Flush and Fsync -- never ran for it. `truncate -s 5 f` reported
+// success and the new size while the stored file kept its old contents.
+//
+// TestSetattrTruncateHydratesExistingContent looks like it covers this, but it
+// calls f.Flush() by hand immediately after Setattr. That is a step the kernel
+// performs only for an fd-based ftruncate, so the test asserts a durability the
+// real path does not have.
+
+func TestSetattrTruncateWithoutFileHandleIsDurable(t *testing.T) {
+	backend := newFuseTestBackend(map[string]string{"notes.txt": "hello world"})
+	w, closeServer := newFuseTestWorkspace(t, backend)
+	defer closeServer()
+	f := &fileNode{w: w, relPath: "notes.txt"}
+
+	var in fuse.SetAttrIn
+	in.Valid = fuse.FATTR_SIZE
+	in.Size = 5
+	var out fuse.AttrOut
+	// fh is nil: exactly what the kernel sends for `truncate -s 5 notes.txt`.
+	if errno := f.Setattr(nil, nil, &in, &out); errno != 0 {
+		t.Fatalf("Setattr() errno = %d", errno)
+	}
+	if out.Size != 5 {
+		t.Fatalf("Setattr() size = %d, want 5", out.Size)
+	}
+	// No Flush: the kernel will never send one for this operation.
+	if got := backend.body("notes.txt"); got != "hello" {
+		t.Fatalf("stored body = %q, want %q — the truncate was reported as succeeding but never uploaded", got, "hello")
+	}
+}
+
+func TestSetattrTruncateWithFileHandleStillBatchesIntoFlush(t *testing.T) {
+	// The guard rail: an ftruncate(2) does carry a handle, and the kernel emits
+	// FLUSH on close(2) of that fd, so it must keep batching. Pushing every
+	// resize eagerly would add an upload to `> file` and every open(..., 'w').
+	backend := newFuseTestBackend(map[string]string{"notes.txt": "hello world"})
+	w, closeServer := newFuseTestWorkspace(t, backend)
+	defer closeServer()
+	f := newFileNodeForTest(w, "notes.txt", "hello world")
+
+	var in fuse.SetAttrIn
+	in.Valid = fuse.FATTR_SIZE
+	in.Size = 0
+	var out fuse.AttrOut
+	if errno := f.Setattr(nil, &fileHandle{f: f}, &in, &out); errno != 0 {
+		t.Fatalf("Setattr() errno = %d", errno)
+	}
+	if got := len(backend.writes()); got != 0 {
+		t.Fatalf("uploads after ftruncate = %d, want 0 — the fd path must wait for FLUSH", got)
+	}
+	if _, errno := f.Write(nil, nil, []byte("hi"), 0); errno != 0 {
+		t.Fatalf("Write() errno = %d", errno)
+	}
+	if errno := f.Flush(nil, nil); errno != 0 {
+		t.Fatalf("Flush() errno = %d", errno)
+	}
+	if got := len(backend.writes()); got != 1 {
+		t.Fatalf("uploads after flush = %d, want exactly 1", got)
+	}
+	if got := backend.body("notes.txt"); got != "hi" {
+		t.Fatalf("stored body = %q, want %q", got, "hi")
+	}
+}
+
+func TestSetattrTruncateReportsAFailedUpload(t *testing.T) {
+	// The caller has no later flush to retry with, so it has to learn now
+	// rather than believe a write that never landed.
+	backend := newFuseTestBackend(map[string]string{"notes.txt": "hello world"})
+	backend.failWrites = true
+	w, closeServer := newFuseTestWorkspace(t, backend)
+	defer closeServer()
+	f := &fileNode{w: w, relPath: "notes.txt"}
+
+	var in fuse.SetAttrIn
+	in.Valid = fuse.FATTR_SIZE
+	in.Size = 5
+	var out fuse.AttrOut
+	if errno := f.Setattr(nil, nil, &in, &out); errno != syscall.EIO {
+		t.Fatalf("Setattr() errno = %d, want EIO when the upload fails", errno)
+	}
+	f.mu.Lock()
+	dirty := f.dirty
+	f.mu.Unlock()
+	if !dirty {
+		t.Fatalf("node was left clean after a failed upload; a later flush can no longer retry it")
+	}
+}
+
+func TestSetattrOversizedTruncateIsAnErrorNotAPanic(t *testing.T) {
+	// The old guard only rejected sizes above maxInt, so this reached
+	// make([]byte, 1e18) and panicked. go-fuse has no recover() in its request
+	// path, so the panic killed the daemon and took /workspace with it.
+	backend := newFuseTestBackend(map[string]string{"f": "x"})
+	w, closeServer := newFuseTestWorkspace(t, backend)
+	defer closeServer()
+	f := newFileNodeForTest(w, "f", "x")
+
+	var in fuse.SetAttrIn
+	in.Valid = fuse.FATTR_SIZE
+	in.Size = 1000000000000000000
+	var out fuse.AttrOut
+	if errno := f.Setattr(nil, nil, &in, &out); errno != syscall.EFBIG {
+		t.Fatalf("Setattr() errno = %d, want EFBIG", errno)
+	}
+	if got := backend.reads(); got != 0 {
+		t.Fatalf("backend reads = %d, want 0 — an impossible size must not cost a hydration", got)
+	}
+}
+
+func TestWriteAtAnAbsurdOffsetIsAnErrorNotAPanic(t *testing.T) {
+	backend := newFuseTestBackend(map[string]string{"f": "x"})
+	w, closeServer := newFuseTestWorkspace(t, backend)
+	defer closeServer()
+	f := newFileNodeForTest(w, "f", "x")
+
+	if _, errno := f.Write(nil, nil, []byte("hi"), 1000000000000000000); errno != syscall.EFBIG {
+		t.Fatalf("Write() errno = %d, want EFBIG", errno)
+	}
+}
+
+func TestWriteBeyondWhatTheServerCanStoreIsRefusedAtTheSyscall(t *testing.T) {
+	// The server caps a whole-file body at 34 MB, so a larger body could only
+	// ever fail at flush -- after the agent was told the write succeeded.
+	backend := newFuseTestBackend(map[string]string{"f": "x"})
+	w, closeServer := newFuseTestWorkspace(t, backend)
+	defer closeServer()
+	f := newFileNodeForTest(w, "f", "x")
+
+	if _, errno := f.Write(nil, nil, []byte("hi"), maxFileBytes); errno != syscall.EFBIG {
+		t.Fatalf("Write() at the ceiling errno = %d, want EFBIG", errno)
+	}
+	if n, errno := f.Write(nil, nil, []byte("hi"), maxFileBytes-2); errno != 0 || n != 2 {
+		t.Fatalf("Write() just inside the ceiling = (%d, %d), want (2, 0)", n, errno)
+	}
+}
+
+func TestWriteWithAnOversizedPayloadIsRefused(t *testing.T) {
+	// The offset half of the guard alone would wrap: maxFileBytes-len(data) is
+	// negative here, and uint64 of that is enormous.
+	backend := newFuseTestBackend(map[string]string{"f": "x"})
+	w, closeServer := newFuseTestWorkspace(t, backend)
+	defer closeServer()
+	f := newFileNodeForTest(w, "f", "x")
+
+	if _, errno := f.Write(nil, nil, make([]byte, maxFileBytes+1), 0); errno != syscall.EFBIG {
+		t.Fatalf("Write() with an oversized payload errno = %d, want EFBIG", errno)
+	}
+}
