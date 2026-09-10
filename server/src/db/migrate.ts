@@ -42,6 +42,10 @@ import {
   ENGINE_DEFAULTS_SQL,
   engineDefaultsChecksum,
 } from './migrations/0007-engine-defaults.js'
+import {
+  AGENT_ROUTING_CLAIMS_SQL,
+  agentRoutingClaimsChecksum,
+} from './migrations/0009-agent-routing-claims.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2551,6 +2555,10 @@ async function applyEngineDefaults(client: import('pg').PoolClient): Promise<voi
   await client.query(ENGINE_DEFAULTS_SQL)
 }
 
+async function applyAgentRoutingClaims(client: import('pg').PoolClient): Promise<void> {
+  await client.query(AGENT_ROUTING_CLAIMS_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2601,6 +2609,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: agentProviderProfileChecksum(),
     transactional: true,
     up: async (client) => { await client.query(AGENT_PROVIDER_PROFILE_SQL) },
+  },
+  {
+    ...SCHEMA_MIGRATIONS[8],
+    sourceChecksum: agentRoutingClaimsChecksum(),
+    transactional: true,
+    up: applyAgentRoutingClaims,
   },
 ]
 
